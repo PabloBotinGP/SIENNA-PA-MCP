@@ -2,7 +2,10 @@
   "name": "SIENNA-PA-MCP Development Container",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": ".."
+    "context": "..",
+    "args": {
+      "TARGETPLATFORM": "${localEnv:DOCKER_DEFAULT_PLATFORM:linux/amd64}"
+    }
   },
   "customizations": {
     "vscode": {
@@ -11,19 +14,40 @@
         "python.linting.enabled": true,
         "python.linting.pylintEnabled": false,
         "python.linting.flake8Enabled": true,
+        "python.linting.flake8Args": ["--max-line-length=88"],
+        "python.testing.pytestEnabled": true,
+        "python.testing.unittestEnabled": false,
         "[python]": {
           "editor.defaultFormatter": "ms-python.black-formatter",
-          "editor.formatOnSave": true
+          "editor.formatOnSave": true,
+          "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+          }
+        },
+        "files.watcherExclude": {
+          "**/.git/objects/**": true,
+          "**/.git/subtree-cache/**": true,
+          "**/node_modules/**": true,
+          "**/__pycache__/**": true,
+          "**/.pytest_cache/**": true
         }
       },
       "extensions": [
         "ms-python.python",
         "ms-python.vscode-pylance",
-        "ms-python.black-formatter"
+        "ms-python.black-formatter",
+        "ms-python.flake8",
+        "ms-python.mypy-type-checker"
       ]
     }
   },
   "forwardPorts": [],
-  "postCreateCommand": "pip install -e mcp-server",
-  "remoteUser": "root"
+  "postCreateCommand": "pip install -e mcp-server[dev]",
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "PYTHONPATH": "/workspace/SIENNA-PA-MCP/mcp-server"
+  },
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace/SIENNA-PA-MCP,type=bind,consistency=cached"
+  ]
 }
