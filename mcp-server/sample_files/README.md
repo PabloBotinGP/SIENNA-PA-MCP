@@ -1,4 +1,4 @@
-# Sample Data File
+# Sample Data Files
 
 This directory contains sample files for testing and demonstration purposes.
 
