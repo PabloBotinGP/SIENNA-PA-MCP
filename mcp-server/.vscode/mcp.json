@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "sienna-pa": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mcp_server.server"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/mcp-server"
+      }
+    }
+  }
+}
