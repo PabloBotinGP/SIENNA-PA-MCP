@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "weather": {
+      "type": "stdio",
+      "command": "/Users/pbotin/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/weather",
+        "run",
+        "weather.py"
+      ]
+    }
+  }
+}
