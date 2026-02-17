@@ -22,6 +22,3 @@ Troubleshooting
 Development notes
 - Main server file: `weather.py` (defines MCP tools and starts the server).
 - Dependency manifest: `pyproject.toml`.
-
-If you'd like, I can also add a short script to run simple end-to-end tests for the tools.
-

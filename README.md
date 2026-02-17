@@ -31,7 +31,3 @@ Testing
 cd weather
 uv run python3 -m pytest -q
 ```
-
-If you'd like I can also add CI configuration to run these tests on push.
-
-
