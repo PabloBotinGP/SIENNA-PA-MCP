@@ -1,8 +1,25 @@
+import asyncio
+import os
+import tempfile
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+# ---------------------------------------------------------------------------
+# Configuration — adjust these to match the local environment
+# ---------------------------------------------------------------------------
+JULIA_EXECUTABLE = os.environ.get("JULIA_EXECUTABLE", "julia")
+PA_PROJECT_PATH = Path(
+    os.environ.get("PA_PROJECT_PATH", ".")
+)  # Julia project with PowerAnalytics.jl
+RESULTS_DIR = Path(
+    os.environ.get("PA_RESULTS_DIR", ".")
+)  # default directory for simulation results
+SCRIPT_TIMEOUT = int(os.environ.get("PA_SCRIPT_TIMEOUT", "300"))  # seconds
+
+# ---------------------------------------------------------------------------
 # Initialize FastMCP server
+# ---------------------------------------------------------------------------
 mcp = FastMCP(
     "poweranalytics",
     instructions="""
@@ -11,43 +28,397 @@ mcp = FastMCP(
     PowerSimulations.jl with data structures from PowerSystems.jl.
 
     PowerAnalytics runs locally via the Julia REPL. There are no remote API calls.
-    Your workflow when a user requests analysis is:
-    1. Activate the Julia REPL and the project environment.
-    2. Generate a Julia script that uses the PowerAnalytics.jl public API.
-    3. Execute the script in the REPL.
-    4. Save results to a data file when appropriate.
-    5. Analyze the output and explain the results back to the user.
 
-    When writing Julia code:
-    - Use only functions, types, and methods from the PowerAnalytics.jl public API.
-    - Activate the correct project environment before running any code.
-    - Handle errors gracefully and report them clearly.
+    Workflow:
+    1. Use check_julia_environment to verify the setup is correct.
+    2. Use high-level tools (get_active_power_timeseries) for common queries — these
+       generate and execute correct Julia scripts internally.
+    3. Use run_julia_script only for custom analysis not covered by the high-level tools.
+    4. Use list_result_files to discover available simulation results and output files.
+    5. Read the poweranalytics://api-reference and poweranalytics://component-types
+       resources before writing custom Julia code.
 
     When explaining results:
     - Provide context in terms of power system operations and economics.
     - Include units (MW, MWh, $/MWh, etc.) with all numeric values.
     - Summarize trends and highlight noteworthy observations.
+
+    If a script fails, read the error message, fix the script, and retry.
     """,
 )
 
-# Paths — configure these to match the local environment
-JULIA_EXECUTABLE = "julia"  # path to Julia binary, or just "julia" if on PATH
-PA_PROJECT_PATH = Path(".")  # placeholder — path to the PowerAnalytics.jl project
+# ---------------------------------------------------------------------------
+# Julia execution helper
+# ---------------------------------------------------------------------------
+
+JULIA_PREAMBLE = """\
+using PowerSystems
+using PowerSimulations
+using StorageSystemsSimulations
+using HydroPowerSimulations
+using DataFrames
+using Dates
+using CSV
+using PowerAnalytics
+using PowerAnalytics.Metrics
+"""
+
+
+async def _run_julia(script: str, project_path: str | None = None) -> dict:
+    """Write *script* to a temp file, run it with Julia, return stdout + stderr."""
+    project = project_path or str(PA_PROJECT_PATH)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jl", delete=False
+    ) as tmp:
+        tmp.write(script)
+        tmp_path = tmp.name
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            JULIA_EXECUTABLE,
+            f"--project={project}",
+            tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=SCRIPT_TIMEOUT
+        )
+        return {
+            "exit_code": proc.returncode,
+            "stdout": stdout.decode(),
+            "stderr": stderr.decode(),
+        }
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Script timed out after {SCRIPT_TIMEOUT} seconds.",
+        }
+    finally:
+        os.unlink(tmp_path)
+
+
+def _format_result(result: dict) -> str:
+    """Format a Julia execution result into a readable string."""
+    parts = []
+    if result["exit_code"] != 0:
+        parts.append(f"Exit code: {result['exit_code']}")
+    if result["stderr"]:
+        parts.append(f"--- stderr ---\n{result['stderr']}")
+    if result["stdout"]:
+        parts.append(f"--- stdout ---\n{result['stdout']}")
+    if not result["stdout"] and not result["stderr"]:
+        parts.append("(no output)")
+    return "\n".join(parts)
+
+
+# ===================================================================
+# TOOLS
+# ===================================================================
+
+
+@mcp.tool()
+async def run_julia_script(script: str, project_path: str | None = None) -> str:
+    """Execute an arbitrary Julia script and return its output.
+
+    The script runs as a subprocess with the PowerAnalytics.jl project activated.
+    Use this for custom analysis not covered by the high-level tools.
+
+    Args:
+        script: Complete Julia source code to execute.
+        project_path: Optional path to a Julia project to activate (defaults to PA_PROJECT_PATH).
+    """
+    result = await _run_julia(script, project_path)
+    return _format_result(result)
+
+
+@mcp.tool()
+async def check_julia_environment(project_path: str | None = None) -> str:
+    """Verify that Julia is available and PowerAnalytics.jl can be loaded.
+
+    Args:
+        project_path: Optional path to the Julia project to check.
+    """
+    script = f"""{JULIA_PREAMBLE}
+println("Julia version: ", VERSION)
+println("PowerAnalytics loaded successfully.")
+println("Project: ", Base.active_project())
+"""
+    result = await _run_julia(script, project_path)
+    if result["exit_code"] == 0:
+        return f"Environment OK.\n{result['stdout']}"
+    return f"Environment check FAILED.\n{_format_result(result)}"
+
+
+@mcp.tool()
+async def get_active_power_timeseries(
+    results_dir: str,
+    problem_name: str,
+    component_type: str,
+    output_csv: str | None = None,
+    scenario: str | None = None,
+) -> str:
+    """Get active power generation time series for a component type.
+
+    Loads simulation results, creates a ComponentSelector for the given type,
+    computes calc_active_power, and returns (or saves) the resulting DataFrame.
+
+    Args:
+        results_dir: Path to the directory containing simulation results.
+        problem_name: Name of the decision model (e.g. "UC" for unit commitment).
+        component_type: PowerSystems.jl component type (e.g. "ThermalStandard",
+            "RenewableDispatch", "HydroDispatch", "EnergyReservoirStorage").
+        output_csv: Optional path to save the results as CSV. If not provided,
+            the first and last rows are printed to stdout.
+        scenario: Optional scenario name to filter (e.g. "Scenario_1"). If not
+            provided, uses the first scenario found.
+    """
+    save_block = ""
+    if output_csv:
+        save_block = f"""
+CSV.write("{output_csv}", df)
+println("Results saved to {output_csv}")
+"""
+
+    scenario_block = ""
+    if scenario:
+        scenario_block = f'results_uc = results_all["{scenario}"]'
+    else:
+        scenario_block = (
+            "scenario_key = first(keys(results_all))\n"
+            'println("Using scenario: ", scenario_key)\n'
+            "results_uc = results_all[scenario_key]"
+        )
+
+    script = f"""{JULIA_PREAMBLE}
+
+# Load simulation results
+results_all = create_problem_results_dict("{results_dir}", "{problem_name}"; populate_system = true)
+
+# Select scenario
+{scenario_block}
+
+# Create selector and compute active power
+selector = make_selector({component_type})
+df = calc_active_power(selector, results_uc)
+
+# Output
+println("Shape: ", size(df))
+println("Columns: ", names(df))
+println()
+println("First rows:")
+show(first(df, 5); allcols = true)
+println()
+println()
+println("Last rows:")
+show(last(df, 5); allcols = true)
+println()
+{save_block}
+"""
+    result = await _run_julia(script)
+    return _format_result(result)
+
+
+@mcp.tool()
+async def list_result_files(directory: str | None = None, pattern: str = "*") -> str:
+    """List files in a directory, useful for discovering simulation results or saved outputs.
+
+    Args:
+        directory: Path to search. Defaults to the configured results directory.
+        pattern: Glob pattern to filter files (e.g. "*.csv", "*.h5").
+    """
+    search_dir = Path(directory) if directory else RESULTS_DIR
+    if not search_dir.exists():
+        return f"Directory not found: {search_dir}"
+
+    files = sorted(search_dir.rglob(pattern))
+    if not files:
+        return f"No files matching '{pattern}' in {search_dir}"
+
+    lines = [f"Files in {search_dir} (pattern: {pattern}):"]
+    for f in files[:100]:  # cap at 100 entries
+        rel = f.relative_to(search_dir)
+        size_kb = f.stat().st_size / 1024
+        lines.append(f"  {rel}  ({size_kb:.1f} KB)")
+    if len(files) > 100:
+        lines.append(f"  ... and {len(files) - 100} more files")
+    return "\n".join(lines)
+
+
+# ===================================================================
+# RESOURCES
+# ===================================================================
+
+
+@mcp.resource("poweranalytics://api-reference")
+def get_api_reference() -> str:
+    """PowerAnalytics.jl public API reference — key functions and usage patterns."""
+    return """\
+# PowerAnalytics.jl — API Reference
+
+## Loading Results
+- `create_problem_results_dict(results_dir, problem_name; populate_system=true)`
+  Loads all scenario results from `results_dir`. Returns a SortedDict where keys are
+  scenario folder names (e.g. "Scenario_1") and values are SimulationProblemResults.
+  `problem_name` must match the name used when creating the DecisionModel (e.g. "UC").
+
+## Component Selectors
+- `make_selector(ComponentType)`
+  Creates a ComponentSelector for a PowerSystems.jl component type.
+  By default selects each individual (available) component of that type.
+  Example: `make_selector(ThermalStandard)`
+
+## Metrics (from PowerAnalytics.Metrics)
+- `calc_active_power(selector, results) -> DataFrame`
+  Returns active power time series. Each column is one component; first column is DateTime.
+
+## Required Packages
+```julia
+using PowerSystems
+using PowerSimulations
+using StorageSystemsSimulations
+using HydroPowerSimulations
+using DataFrames
+using Dates
+using CSV
+using PowerAnalytics
+using PowerAnalytics.Metrics
+```
+
+## Common Component Types (from PowerSystems.jl)
+- ThermalStandard — conventional thermal generators
+- RenewableDispatch — dispatchable renewable generators
+- RenewableNonDispatch — non-dispatchable renewables (fixed output)
+- HydroDispatch — run-of-river hydro
+- HydroEnergyReservoir — hydro with storage reservoir
+- EnergyReservoirStorage — battery / energy storage
+- PowerLoad — system loads
+- Line — transmission lines
+- TapTransformer — tap-changing transformers
+"""
+
+
+@mcp.resource("poweranalytics://component-types")
+def get_component_types() -> str:
+    """Available PowerSystems.jl component types and their simulation formulations."""
+    return """\
+# Component Types and Formulations
+
+The following component types are available in the RTS-GMLC test system simulations.
+The formulation determines what variables/constraints are available in the results.
+
+| Component Type          | Formulation                  | Key Result Variables            |
+|-------------------------|------------------------------|---------------------------------|
+| ThermalStandard         | ThermalBasicUnitCommitment   | ActivePowerVariable, OnVariable |
+| RenewableDispatch       | RenewableFullDispatch        | ActivePowerVariable             |
+| RenewableNonDispatch    | FixedOutput                  | ActivePowerVariable             |
+| HydroDispatch           | HydroDispatchRunOfRiver      | ActivePowerVariable             |
+| HydroEnergyReservoir    | HydroDispatchRunOfRiver      | ActivePowerVariable             |
+| EnergyReservoirStorage  | StorageDispatchWithReserves  | ActivePowerVariable, EnergyVar  |
+| PowerLoad               | StaticPowerLoad              | ActivePowerVariable             |
+| Line                    | StaticBranch                 | FlowActivePowerVariable         |
+| TapTransformer          | StaticBranch                 | FlowActivePowerVariable         |
+
+## Notes
+- Only *available* components appear in results by default.
+- Use `make_selector(ComponentType)` to select all components of a type.
+- The network model used is CopperPlatePowerModel (no nodal constraints).
+"""
+
+
+# ===================================================================
+# PROMPTS
+# ===================================================================
+
+
+@mcp.prompt()
+def analyze_generation(
+    component_type: str = "ThermalStandard",
+    results_dir: str = "_simulation_results_RTS",
+    problem_name: str = "UC",
+) -> str:
+    """Template for analyzing generation time series by component type.
+
+    Generates a ready-to-use Julia script. Fill in the parameters for your use case.
+
+    Args:
+        component_type: PowerSystems.jl component type (e.g. ThermalStandard).
+        results_dir: Path to simulation results directory.
+        problem_name: Decision model name (e.g. UC).
+    """
+    return f"""\
+Analyze the active power generation for {component_type} components.
+
+Use the get_active_power_timeseries tool with:
+- results_dir: "{results_dir}"
+- problem_name: "{problem_name}"
+- component_type: "{component_type}"
+
+After getting the results:
+1. Identify which generators are online vs offline (zero generation).
+2. Summarize the range of generation (min/max MW) for each active generator.
+3. Note any interesting patterns (ramping, cycling, baseload behavior).
+4. If multiple scenarios are available, compare them.
+
+If you need to save results, use the output_csv parameter with a descriptive filename
+like "results/{component_type}_active_power.csv".
+"""
+
+
+@mcp.prompt()
+def compare_scenarios(
+    component_type: str = "ThermalStandard",
+    results_dir: str = "_simulation_results_RTS",
+    problem_name: str = "UC",
+) -> str:
+    """Template for comparing generation across scenarios.
+
+    Args:
+        component_type: PowerSystems.jl component type.
+        results_dir: Path to simulation results directory.
+        problem_name: Decision model name.
+    """
+    return f"""\
+Compare the {component_type} generation across all available scenarios.
+
+Steps:
+1. Use run_julia_script to load results and compute active power for ALL scenarios:
+
+```julia
+{JULIA_PREAMBLE}
+
+results_all = create_problem_results_dict("{results_dir}", "{problem_name}"; populate_system = true)
+selector = make_selector({component_type})
+
+for (name, results_uc) in results_all
+    println("=== Scenario: ", name, " ===")
+    df = calc_active_power(selector, results_uc)
+    println("Shape: ", size(df))
+
+    # Total generation per timestep
+    gen_cols = names(df)[2:end]  # skip DateTime column
+    df.total = sum(eachcol(df[!, gen_cols]))
+    println("Total generation range: ", minimum(df.total), " — ", maximum(df.total), " MW")
+    println("Mean total generation: ", round(mean(df.total); digits=2), " MW")
+    println()
+
+    CSV.write("results/$(name)_{component_type}_active_power.csv", df)
+    println("Saved to results/$(name)_{component_type}_active_power.csv")
+    println()
+end
+```
+
+2. After getting results, compare:
+   - Total generation levels across scenarios
+   - Which generators change behavior between scenarios
+   - Impact on system economics (if cost data is available)
+"""
 
 
 # ---------------------------------------------------------------------------
-# Tools, resources, and prompts will be added here.
-#
-# Examples of future tools:
-#   - run_julia_script: Execute a Julia script in the REPL
-#   - activate_project: Activate the PowerAnalytics.jl project environment
-#
-# Examples of future resources:
-#   - PowerAnalytics.jl public API reference
-#   - Available simulation result datasets
-#
-# Examples of future prompts:
-#   - Standard analysis templates (e.g. generation by fuel type, cost breakdown)
+# Entry point
 # ---------------------------------------------------------------------------
 
 

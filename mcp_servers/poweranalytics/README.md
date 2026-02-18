@@ -7,38 +7,64 @@ PowerAnalytics runs locally via the Julia REPL (no remote API calls). The server
 tools, resources, and prompts that allow the LLM to generate Julia scripts, execute them,
 and interpret the results on behalf of the user.
 
-> **Status:** Skeleton — tools, resources, and prompts are not yet implemented.
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `check_julia_environment` | Verify Julia is available and PowerAnalytics.jl can be loaded |
+| `get_active_power_timeseries` | Get generation time series for a component type (high-level, generates script internally) |
+| `run_julia_script` | Execute arbitrary Julia code (escape hatch for custom analysis) |
+| `list_result_files` | Discover simulation result files and saved outputs |
+
+## Resources
+
+| URI | Description |
+|-----|-------------|
+| `poweranalytics://api-reference` | PowerAnalytics.jl API reference (functions, usage patterns) |
+| `poweranalytics://component-types` | Component types, formulations, and available result variables |
+
+## Prompts
+
+| Prompt | Description |
+|--------|-------------|
+| `analyze_generation` | Template for analyzing generation time series by component type |
+| `compare_scenarios` | Template for comparing generation across simulation scenarios |
+
+## Configuration
+
+Set via environment variables or edit constants in `poweranalytics.py`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JULIA_EXECUTABLE` | `julia` | Path to Julia binary |
+| `PA_PROJECT_PATH` | `.` | Julia project with PowerAnalytics.jl |
+| `PA_RESULTS_DIR` | `.` | Default directory for simulation results |
+| `PA_SCRIPT_TIMEOUT` | `300` | Max seconds for a Julia script to run |
+
+## Prerequisites
+
+- **Julia** must be installed and available on PATH (or set `JULIA_EXECUTABLE`).
+- **PowerAnalytics.jl** and its dependencies (PowerSystems.jl, PowerSimulations.jl, etc.)
+  must be available in the target Julia project environment.
 
 ## How to run and use the MCP server
 
 - Open the MCP extension in your editor and go to **MCP: List Servers**.
 - Choose the **poweranalytics** server and click **Start Server** if it is not already running.
-- If you modify any server code (for example `poweranalytics.py`), select the server again
-  and click **Restart Server** to pick up the changes.
+- If you modify any server code, select the server again and click **Restart Server**.
 
-## Prerequisites
+## Example usage
 
-- **Julia** must be installed and available on PATH (or configure `JULIA_EXECUTABLE` in
-  `poweranalytics.py`).
-- **PowerAnalytics.jl** must be installed / available in the target Julia project environment.
+Ask: *"Get the generation time series for each thermal component in the system"*
 
-## Using the tools from the LLM chat
-
-- Ask questions in the LLM chat (for example: "Get the generation time series for each
-  thermal component in the system").
-- The LLM will use the MCP tools to activate the Julia project, generate and run a script
-  using the PowerAnalytics.jl public API, and return the results with an explanation.
-- When a tool is invoked, the assistant will request permission within the chat session
-  before using it.
-
-## Troubleshooting
-
-- If Julia is not found, verify it is on your PATH or update `JULIA_EXECUTABLE` in
-  `poweranalytics.py`.
-- If tools return error messages, restart the `poweranalytics` server and re-run the query.
+The LLM will:
+1. Read the `poweranalytics://api-reference` resource to understand the API
+2. Call `get_active_power_timeseries` with `component_type="ThermalStandard"`
+3. Return a summary of the results with MW values and generation patterns
 
 ## Development notes
 
-- Main server file: `poweranalytics.py` (defines MCP server, tools, resources, prompts).
-- Entry point: `main.py` (imports and calls `main()` from `poweranalytics.py`).
-- Dependency manifest: `pyproject.toml`.
+- Main server file: `poweranalytics.py`
+- Entry point: `main.py`
+- Tests: `tests/test_poweranalytics_tools.py` (15 tests)
+- Dependency manifest: `pyproject.toml`
