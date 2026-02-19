@@ -32,7 +32,7 @@ and interpret the results on behalf of the user.
 
 ## Configuration
 
-Set via environment variables or edit constants in `poweranalytics.py`:
+Set via environment variables or edit constants in `server.py`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -95,7 +95,7 @@ The LLM will:
 
 ## Development notes
 
-- Main server file: `poweranalytics.py`
+- Main server file: `server.py`
 - Entry point: `main.py`
 - Tests: `tests/test_poweranalytics_tools.py` (15 tests)
 - Dependency manifest: `pyproject.toml`

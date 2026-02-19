@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Package managers
+uv.lock
+Cargo.lock
+
+# MCP server artifacts
+# Precompiled Julia sysimages are large (~500 MB–1 GB) and should be
+# built locally for each environment. Do not commit them.
+mcp_servers/poweranalytics/pa_sysimage.so
+mcp_servers/*/pa_sysimage.so
+*.sysimage
+
+# Temporary files
+*.tmp
+*.bak
+*.log

@@ -33,7 +33,7 @@ A complete MCP (Model Context Protocol) server that enables Claude to interact w
 
 ```
 mcp_servers/poweranalytics/
-├── poweranalytics.py           # Main server (tools, resources, prompts)
+├── server.py           # Main server (tools, resources, prompts)
 ├── main.py                      # Entry point for MCP extension
 ├── pyproject.toml               # Python dependencies + pytest config
 ├── .python-version              # Python 3.11
@@ -94,7 +94,7 @@ CSV.write("results/thermal_output.csv", df)
 
 ## Configuration
 
-Set via environment variables (or edit constants in `poweranalytics.py`):
+Set via environment variables (or edit constants in `server.py`):
 
 ```bash
 export JULIA_EXECUTABLE="julia"                     # Path to Julia binary
@@ -176,7 +176,7 @@ See [DEMO.md](DEMO.md) for full interactions.
 
 ### To Add More Tools
 
-1. Create a new `@mcp.tool()` function in `poweranalytics.py`
+1. Create a new `@mcp.tool()` function in `server.py`
 2. Generate Julia script internally (don't make LLM write it)
 3. Add test in `tests/test_poweranalytics_tools.py`
 4. Run: `.venv/bin/pytest tests/ -v`
@@ -205,7 +205,7 @@ async def compute_system_cost(results_dir, scenario):
 - **README.md** — User guide, tool/resource/prompt summary
 - **SETUP.md** — Registration and configuration instructions
 - **DEMO.md** — Realistic interaction examples
-- **poweranalytics.py** — Docstrings for all tools/resources/prompts
+- **server.py** — Docstrings for all tools/resources/prompts
 
 ## Dependencies
 

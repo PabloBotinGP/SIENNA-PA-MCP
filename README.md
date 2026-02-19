@@ -1,33 +1,132 @@
-## Weather MCP Server
+# PowerAnalytics MCP Server
 
-This repository exposes a small MCP server that provides two tools:
+A comprehensive MCP (Model Context Protocol) server that enables Claude to interact with **PowerAnalytics.jl** — a Julia package for analyzing power system simulation results locally.
 
-- `get_alerts(state)` — Returns active NWS alerts for the given U.S. state (two-letter code).
-- `get_forecast(latitude, longitude[, periods_count])` — Returns the NWS forecast for a location. `periods_count` is optional (default 14).
+## Overview
 
-Usage
-- Open the MCP extension in your editor and run **MCP: List Servers**.
-- Choose the `weather` server and click **Start Server** if it is not already running.
-- If you modify any server code (for example `weather.py`), select the `weather` server again and click **Restart Server** to pick up the changes.
+This repository contains the PowerAnalytics MCP server, which exposes:
 
-LLM chat + tools
-- Ask questions in the LLM chat (for example: "What's the forecast for Golden, CO?").
-- The assistant will ask for permission in-chat before invoking MCP tools and will use `get_alerts` / `get_forecast` when appropriate.
-- If a tool fails, check the Tools icon in the LLM chat UI and verify the `weather` tool box is enabled.
+- **4 Tools** — Generate and execute Julia scripts, check environment, discover results
+- **2 Resources** — API reference and component type documentation
+- **2 Prompts** — Analysis workflow templates
 
-Troubleshooting
-- SSL / corporate proxy: this project uses the OS trust store via `truststore` to avoid SSL interception issues in corporate environments. Ensure the MCP server process uses the same Python interpreter/venv and that dependencies are installed (`pyproject.toml`).
-- "Unable to fetch...": restart the `weather` server and re-run the query.
+## Quick Start
 
-Project layout
-- `weather/weather.py` — MCP server implementation and tool definitions.
-- `weather/pyproject.toml` — package dependencies.
-- `weather/README.md` — package-level notes (also included here).
+1. **Register the server** in your MCP extension:
+   ```json
+   {
+     "poweranalytics": {
+       "command": "python",
+       "args": ["-m", "mcp.server.fastmcp", "path/to/main.py"],
+       "env": {
+         "PA_PROJECT_PATH": "/path/to/julia/project",
+         "PA_RESULTS_DIR": "/path/to/simulation/results"
+       }
+     }
+   }
+   ```
 
-Testing
-- Unit tests live under `weather/tests/` and can be run with `pytest` in the `weather` directory. Example:
+2. **Start the server** via MCP extension: List Servers → poweranalytics → Start Server
+
+3. **Ask Claude**:
+   ```
+   "Obtain the generation time series for each thermal component"
+   ```
+
+## What PowerAnalytics.jl Does
+
+PowerAnalytics.jl is a Julia package for analyzing power system simulation results from PowerSimulations.jl. It provides:
+
+- Extracting generation, costs, and power flows by component type
+- Aggregating results across time periods, regions, or asset categories
+- Computing metrics and analyzing system behavior
+- Preparing data for visualization and reporting
+
+## Architecture
+
+**No remote API calls** — PowerAnalytics runs locally via Julia subprocess.
+
+**Three levels of tools:**
+
+| Level | Tool | Type | Use Case |
+|-------|------|------|----------|
+| High-level | `get_active_power_timeseries` | Option C | Generation by component type |
+| Escape hatch | `run_julia_script` | Raw Julia | Custom analysis |
+| Utility | `check_julia_environment`, `list_result_files` | Diagnostic | Setup & discovery |
+
+**Resources** prevent hallucination:
+- `poweranalytics://api-reference` — PowerAnalytics.jl API documentation
+- `poweranalytics://component-types` — Available types and formulations
+
+**Prompts** guide workflows:
+- `analyze_generation` — Generation time series analysis template
+- `compare_scenarios` — Cross-scenario comparison template
+
+## Project Layout
+
+```
+mcp_servers/poweranalytics/
+├── server.py                      # Main server
+├── main.py                         # MCP entry point
+├── pyproject.toml                  # Dependencies
+├── README.md                       # Full user guide
+├── SETUP.md                        # Configuration instructions
+├── DEMO.md                         # Example interactions
+├── QUICK_START.md                  # Quick reference
+└── tests/
+    └── test_poweranalytics_tools.py  # 15 unit tests
+```
+
+## Usage Examples
+
+### Example 1: Get thermal generation
+```
+User: "Get the generation time series for each thermal component"
+
+LLM:
+- Reads poweranalytics://api-reference
+- Calls get_active_power_timeseries(component_type="ThermalStandard", ...)
+- Explains: "76 thermal units, baseload nuclear at 400 MW, peakers cycle..."
+```
+
+### Example 2: Compare scenarios
+```
+User: "How did storage capacity affect generation in Scenario 2?"
+
+LLM:
+- Uses compare_scenarios prompt
+- Calls run_julia_script with cross-scenario comparison
+- Explains: "Storage displaced ~250 MW of thermal generation on average"
+```
+
+## Configuration
+
+Set via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JULIA_EXECUTABLE` | `julia` | Path to Julia binary |
+| `PA_PROJECT_PATH` | `.` | Julia project with PowerAnalytics.jl |
+| `PA_RESULTS_DIR` | `.` | Simulation results directory |
+| `PA_SCRIPT_TIMEOUT` | `300` | Max seconds per Julia script |
+| `PA_SYSIMAGE_PATH` | *(empty)* | Optional precompiled sysimage path |
+
+## Testing
 
 ```bash
-cd weather
-uv run python3 -m pytest -q
+cd mcp_servers/poweranalytics
+pytest tests/ -v
 ```
+
+All 15 tests pass ✓
+
+## Documentation
+
+- **[QUICK_START.md](mcp_servers/poweranalytics/QUICK_START.md)** — 1-minute overview
+- **[README.md](mcp_servers/poweranalytics/README.md)** — Complete user guide
+- **[SETUP.md](mcp_servers/poweranalytics/SETUP.md)** — Installation & configuration
+- **[DEMO.md](mcp_servers/poweranalytics/DEMO.md)** — Example interactions
+
+## Status
+
+✅ **Production ready** — All tools, resources, and prompts implemented and tested.
