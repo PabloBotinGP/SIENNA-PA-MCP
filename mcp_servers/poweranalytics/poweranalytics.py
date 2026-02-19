@@ -16,6 +16,7 @@ RESULTS_DIR = Path(
     os.environ.get("PA_RESULTS_DIR", ".")
 )  # default directory for simulation results
 SCRIPT_TIMEOUT = int(os.environ.get("PA_SCRIPT_TIMEOUT", "300"))  # seconds
+SYSIMAGE_PATH = os.environ.get("PA_SYSIMAGE_PATH", "")  # optional precompiled sysimage
 
 # ---------------------------------------------------------------------------
 # Initialize FastMCP server
@@ -65,7 +66,11 @@ using PowerAnalytics.Metrics
 
 
 async def _run_julia(script: str, project_path: str | None = None) -> dict:
-    """Write *script* to a temp file, run it with Julia, return stdout + stderr."""
+    """Write *script* to a temp file, run it with Julia, return stdout + stderr.
+
+    The subprocess ``cwd`` is set to *project_path* so that relative paths
+    inside Julia scripts (e.g. ``_simulation_results_RTS``) resolve correctly.
+    """
     project = project_path or str(PA_PROJECT_PATH)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".jl", delete=False
@@ -74,12 +79,18 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
         tmp_path = tmp.name
 
     try:
+        cmd = [JULIA_EXECUTABLE]
+        # Use precompiled sysimage if available (Phase 1 optimisation)
+        sysimage = SYSIMAGE_PATH
+        if sysimage and Path(sysimage).is_file():
+            cmd += [f"--sysimage={sysimage}"]
+        cmd += [f"--project={project}", tmp_path]
+
         proc = await asyncio.create_subprocess_exec(
-            JULIA_EXECUTABLE,
-            f"--project={project}",
-            tmp_path,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=project,  # run from project root so relative paths work
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=SCRIPT_TIMEOUT
@@ -159,6 +170,7 @@ async def get_active_power_timeseries(
     component_type: str,
     output_csv: str | None = None,
     scenario: str | None = None,
+    project_path: str | None = None,
 ) -> str:
     """Get active power generation time series for a component type.
 
@@ -166,7 +178,8 @@ async def get_active_power_timeseries(
     computes calc_active_power, and returns (or saves) the resulting DataFrame.
 
     Args:
-        results_dir: Path to the directory containing simulation results.
+        results_dir: Path to the directory containing simulation results
+            (relative to the Julia project root or absolute).
         problem_name: Name of the decision model (e.g. "UC" for unit commitment).
         component_type: PowerSystems.jl component type (e.g. "ThermalStandard",
             "RenewableDispatch", "HydroDispatch", "EnergyReservoirStorage").
@@ -174,6 +187,7 @@ async def get_active_power_timeseries(
             the first and last rows are printed to stdout.
         scenario: Optional scenario name to filter (e.g. "Scenario_1"). If not
             provided, uses the first scenario found.
+        project_path: Optional Julia project path. Defaults to PA_PROJECT_PATH.
     """
     save_block = ""
     if output_csv:
@@ -217,7 +231,7 @@ show(last(df, 5); allcols = true)
 println()
 {save_block}
 """
-    result = await _run_julia(script)
+    result = await _run_julia(script, project_path)
     return _format_result(result)
 
 

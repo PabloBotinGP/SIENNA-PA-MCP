@@ -211,3 +211,78 @@ def test_format_result_error():
     formatted = poweranalytics._format_result(result)
     assert "Exit code: 1" in formatted
     assert "some error" in formatted
+
+
+# ---------------------------------------------------------------------------
+# Sysimage configuration tests
+# ---------------------------------------------------------------------------
+
+
+def test_sysimage_path_default():
+    """PA_SYSIMAGE_PATH defaults to empty string (no sysimage)."""
+    assert hasattr(poweranalytics, "SYSIMAGE_PATH")
+    # default is empty when env var is not set
+    assert isinstance(poweranalytics.SYSIMAGE_PATH, str)
+
+
+@pytest.mark.asyncio
+async def test_run_julia_uses_sysimage_when_available(monkeypatch, tmp_path):
+    """When SYSIMAGE_PATH points to an existing file, --sysimage is added."""
+    sysimage_file = tmp_path / "pa_sysimage.so"
+    sysimage_file.write_bytes(b"\x00" * 10)  # fake file
+    monkeypatch.setattr(poweranalytics, "SYSIMAGE_PATH", str(sysimage_file))
+
+    captured_cmds = []
+
+    original_exec = asyncio.create_subprocess_exec
+
+    async def capture_exec(*args, **kwargs):
+        captured_cmds.append(list(args))
+        # Return a mock process
+        proc = MagicMock()
+        proc.returncode = 0
+
+        async def communicate():
+            return (b"ok\n", b"")
+
+        proc.communicate = communicate
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_exec)
+    monkeypatch.setattr(poweranalytics, "PA_PROJECT_PATH", tmp_path)
+
+    await poweranalytics._run_julia("println(1)")
+    assert len(captured_cmds) == 1
+    cmd = captured_cmds[0]
+    assert any(f"--sysimage={sysimage_file}" in str(a) for a in cmd), (
+        f"Expected --sysimage flag in command: {cmd}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_julia_skips_sysimage_when_missing(monkeypatch, tmp_path):
+    """When SYSIMAGE_PATH is empty or file doesn't exist, --sysimage is NOT added."""
+    monkeypatch.setattr(poweranalytics, "SYSIMAGE_PATH", "")
+
+    captured_cmds = []
+
+    async def capture_exec(*args, **kwargs):
+        captured_cmds.append(list(args))
+        proc = MagicMock()
+        proc.returncode = 0
+
+        async def communicate():
+            return (b"ok\n", b"")
+
+        proc.communicate = communicate
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_exec)
+    monkeypatch.setattr(poweranalytics, "PA_PROJECT_PATH", tmp_path)
+
+    await poweranalytics._run_julia("println(1)")
+    assert len(captured_cmds) == 1
+    cmd = captured_cmds[0]
+    assert not any("--sysimage" in str(a) for a in cmd), (
+        f"Did NOT expect --sysimage flag in command: {cmd}"
+    )

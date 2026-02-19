@@ -40,12 +40,43 @@ Set via environment variables or edit constants in `poweranalytics.py`:
 | `PA_PROJECT_PATH` | `.` | Julia project with PowerAnalytics.jl |
 | `PA_RESULTS_DIR` | `.` | Default directory for simulation results |
 | `PA_SCRIPT_TIMEOUT` | `300` | Max seconds for a Julia script to run |
+| `PA_SYSIMAGE_PATH` | *(empty)* | Optional path to a precompiled Julia sysimage (see below) |
 
 ## Prerequisites
 
 - **Julia** must be installed and available on PATH (or set `JULIA_EXECUTABLE`).
 - **PowerAnalytics.jl** and its dependencies (PowerSystems.jl, PowerSimulations.jl, etc.)
   must be available in the target Julia project environment.
+
+## Sysimage (Phase 1 optimisation)
+
+Every MCP tool call launches a fresh Julia process. Julia's JIT compilation adds
+~15–30 s of overhead to the first `using` statements. A **precompiled sysimage**
+eliminates this cost, bringing per-call latency down to ~2–3 s.
+
+### Build the sysimage
+
+```bash
+# Run from the Julia project root (where Project.toml lives):
+cd /path/to/PowerAnalytics
+julia --project=. /path/to/SIENNA-PA-MCP/mcp_servers/poweranalytics/build_sysimage.jl
+```
+
+This produces `pa_sysimage.so` (~500 MB–1 GB). Build time is 5–15 minutes.
+
+### Activate the sysimage
+
+Add `PA_SYSIMAGE_PATH` to the server's `env` block in `.vscode/mcp.json`:
+
+```jsonc
+"env": {
+    "PA_SYSIMAGE_PATH": "/path/to/PowerAnalytics/pa_sysimage.so",
+    ...
+}
+```
+
+Restart the MCP server. Subsequent tool calls will use the sysimage automatically.
+When packages are updated, rebuild the sysimage to stay in sync.
 
 ## How to run and use the MCP server
 

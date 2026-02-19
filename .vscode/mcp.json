@@ -5,10 +5,26 @@
       "command": "/Users/pbotin/.local/bin/uv",
       "args": [
         "--directory",
-        "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/weather",
+        "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/weather",
         "run",
         "weather.py"
       ]
+    },
+    "poweranalytics": {
+      "type": "stdio",
+      "command": "/Users/pbotin/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics",
+        "run",
+        "poweranalytics.py"
+      ],
+      "env": {
+        "PA_PROJECT_PATH": "/Users/pbotin/Documents/GPAC/Models/PowerAnalytics",
+        "PA_RESULTS_DIR": "/Users/pbotin/Documents/GPAC/Models/PowerAnalytics",
+        "PA_SCRIPT_TIMEOUT": "600",
+        "PA_SYSIMAGE_PATH": "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics/pa_sysimage.so"
+      }
     }
   }
 }
