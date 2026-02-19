@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 from pathlib import Path
 
-import poweranalytics
+import mcp_servers.poweranalytics.server as server
 
 
 # ---------------------------------------------------------------------------
@@ -15,8 +15,8 @@ import poweranalytics
 @pytest.fixture(autouse=True)
 def set_project_path(tmp_path, monkeypatch):
     """Point PA_PROJECT_PATH to a temp dir for all tests."""
-    monkeypatch.setattr(poweranalytics, "PA_PROJECT_PATH", tmp_path)
-    monkeypatch.setattr(poweranalytics, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(server, "PA_PROJECT_PATH", tmp_path)
+    monkeypatch.setattr(server, "RESULTS_DIR", tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -29,8 +29,8 @@ async def test_run_julia_script_success(monkeypatch):
     async def fake_run_julia(script, project_path=None):
         return {"exit_code": 0, "stdout": "hello from julia\n", "stderr": ""}
 
-    monkeypatch.setattr(poweranalytics, "_run_julia", fake_run_julia)
-    result = await poweranalytics.run_julia_script('println("hello from julia")')
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.run_julia_script('println("hello from julia")')
     assert "hello from julia" in result
 
 
@@ -39,8 +39,8 @@ async def test_run_julia_script_failure(monkeypatch):
     async def fake_run_julia(script, project_path=None):
         return {"exit_code": 1, "stdout": "", "stderr": "ERROR: LoadError"}
 
-    monkeypatch.setattr(poweranalytics, "_run_julia", fake_run_julia)
-    result = await poweranalytics.run_julia_script("bad code")
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.run_julia_script("bad code")
     assert "ERROR" in result
     assert "Exit code: 1" in result
 
@@ -59,8 +59,8 @@ async def test_check_environment_ok(monkeypatch):
             "stderr": "",
         }
 
-    monkeypatch.setattr(poweranalytics, "_run_julia", fake_run_julia)
-    result = await poweranalytics.check_julia_environment()
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.check_julia_environment()
     assert "Environment OK" in result
     assert "PowerAnalytics loaded" in result
 
@@ -74,8 +74,8 @@ async def test_check_environment_fail(monkeypatch):
             "stderr": "Package PowerAnalytics not found",
         }
 
-    monkeypatch.setattr(poweranalytics, "_run_julia", fake_run_julia)
-    result = await poweranalytics.check_julia_environment()
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.check_julia_environment()
     assert "FAILED" in result
 
 
@@ -92,8 +92,8 @@ async def test_get_active_power_timeseries_generates_correct_script(monkeypatch)
         captured_scripts.append(script)
         return {"exit_code": 0, "stdout": "Shape: (744, 77)\n", "stderr": ""}
 
-    monkeypatch.setattr(poweranalytics, "_run_julia", fake_run_julia)
-    result = await poweranalytics.get_active_power_timeseries(
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.get_active_power_timeseries(
         results_dir="_simulation_results_RTS",
         problem_name="UC",
         component_type="ThermalStandard",
@@ -119,8 +119,8 @@ async def test_get_active_power_timeseries_with_csv(monkeypatch):
             "stderr": "",
         }
 
-    monkeypatch.setattr(poweranalytics, "_run_julia", fake_run_julia)
-    result = await poweranalytics.get_active_power_timeseries(
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.get_active_power_timeseries(
         results_dir="_results",
         problem_name="UC",
         component_type="RenewableDispatch",
@@ -139,14 +139,14 @@ async def test_get_active_power_timeseries_with_csv(monkeypatch):
 async def test_list_result_files(tmp_path):
     (tmp_path / "data.csv").write_text("a,b\n1,2\n")
     (tmp_path / "results.h5").write_bytes(b"\x00" * 100)
-    result = await poweranalytics.list_result_files(str(tmp_path))
+    result = await server.list_result_files(str(tmp_path))
     assert "data.csv" in result
     assert "results.h5" in result
 
 
 @pytest.mark.asyncio
 async def test_list_result_files_not_found():
-    result = await poweranalytics.list_result_files("/nonexistent/path")
+    result = await server.list_result_files("/nonexistent/path")
     assert "not found" in result.lower()
 
 
@@ -154,7 +154,7 @@ async def test_list_result_files_not_found():
 async def test_list_result_files_with_pattern(tmp_path):
     (tmp_path / "a.csv").write_text("x")
     (tmp_path / "b.txt").write_text("y")
-    result = await poweranalytics.list_result_files(str(tmp_path), pattern="*.csv")
+    result = await server.list_result_files(str(tmp_path), pattern="*.csv")
     assert "a.csv" in result
     assert "b.txt" not in result
 
@@ -165,14 +165,14 @@ async def test_list_result_files_with_pattern(tmp_path):
 
 
 def test_api_reference_resource():
-    content = poweranalytics.get_api_reference()
+    content = server.get_api_reference()
     assert "create_problem_results_dict" in content
     assert "make_selector" in content
     assert "calc_active_power" in content
 
 
 def test_component_types_resource():
-    content = poweranalytics.get_component_types()
+    content = server.get_component_types()
     assert "ThermalStandard" in content
     assert "EnergyReservoirStorage" in content
 
@@ -183,13 +183,13 @@ def test_component_types_resource():
 
 
 def test_analyze_generation_prompt():
-    prompt = poweranalytics.analyze_generation(component_type="HydroDispatch")
+    prompt = server.analyze_generation(component_type="HydroDispatch")
     assert "HydroDispatch" in prompt
     assert "get_active_power_timeseries" in prompt
 
 
 def test_compare_scenarios_prompt():
-    prompt = poweranalytics.compare_scenarios(component_type="EnergyReservoirStorage")
+    prompt = server.compare_scenarios(component_type="EnergyReservoirStorage")
     assert "EnergyReservoirStorage" in prompt
     assert "create_problem_results_dict" in prompt
 
@@ -201,14 +201,14 @@ def test_compare_scenarios_prompt():
 
 def test_format_result_success():
     result = {"exit_code": 0, "stdout": "output here", "stderr": ""}
-    formatted = poweranalytics._format_result(result)
+    formatted = server._format_result(result)
     assert "output here" in formatted
     assert "Exit code" not in formatted
 
 
 def test_format_result_error():
     result = {"exit_code": 1, "stdout": "", "stderr": "some error"}
-    formatted = poweranalytics._format_result(result)
+    formatted = server._format_result(result)
     assert "Exit code: 1" in formatted
     assert "some error" in formatted
 
@@ -220,9 +220,9 @@ def test_format_result_error():
 
 def test_sysimage_path_default():
     """PA_SYSIMAGE_PATH defaults to empty string (no sysimage)."""
-    assert hasattr(poweranalytics, "SYSIMAGE_PATH")
+    assert hasattr(server, "SYSIMAGE_PATH")
     # default is empty when env var is not set
-    assert isinstance(poweranalytics.SYSIMAGE_PATH, str)
+    assert isinstance(server.SYSIMAGE_PATH, str)
 
 
 @pytest.mark.asyncio
@@ -230,7 +230,7 @@ async def test_run_julia_uses_sysimage_when_available(monkeypatch, tmp_path):
     """When SYSIMAGE_PATH points to an existing file, --sysimage is added."""
     sysimage_file = tmp_path / "pa_sysimage.so"
     sysimage_file.write_bytes(b"\x00" * 10)  # fake file
-    monkeypatch.setattr(poweranalytics, "SYSIMAGE_PATH", str(sysimage_file))
+    monkeypatch.setattr(server, "SYSIMAGE_PATH", str(sysimage_file))
 
     captured_cmds = []
 
@@ -249,9 +249,9 @@ async def test_run_julia_uses_sysimage_when_available(monkeypatch, tmp_path):
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_exec)
-    monkeypatch.setattr(poweranalytics, "PA_PROJECT_PATH", tmp_path)
+    monkeypatch.setattr(server, "PA_PROJECT_PATH", tmp_path)
 
-    await poweranalytics._run_julia("println(1)")
+    await server._run_julia("println(1)")
     assert len(captured_cmds) == 1
     cmd = captured_cmds[0]
     assert any(f"--sysimage={sysimage_file}" in str(a) for a in cmd), (
@@ -262,7 +262,7 @@ async def test_run_julia_uses_sysimage_when_available(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_run_julia_skips_sysimage_when_missing(monkeypatch, tmp_path):
     """When SYSIMAGE_PATH is empty or file doesn't exist, --sysimage is NOT added."""
-    monkeypatch.setattr(poweranalytics, "SYSIMAGE_PATH", "")
+    monkeypatch.setattr(server, "SYSIMAGE_PATH", "")
 
     captured_cmds = []
 
@@ -278,9 +278,9 @@ async def test_run_julia_skips_sysimage_when_missing(monkeypatch, tmp_path):
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_exec)
-    monkeypatch.setattr(poweranalytics, "PA_PROJECT_PATH", tmp_path)
+    monkeypatch.setattr(server, "PA_PROJECT_PATH", tmp_path)
 
-    await poweranalytics._run_julia("println(1)")
+    await server._run_julia("println(1)")
     assert len(captured_cmds) == 1
     cmd = captured_cmds[0]
     assert not any("--sysimage" in str(a) for a in cmd), (

@@ -1,19 +1,15 @@
 {
-  "servers": {
+  "mcpServers": {
     "poweranalytics": {
-      "type": "stdio",
-      "command": "/Users/pbotin/.local/bin/uv",
+      "command": "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics/.venv/bin/python",
       "args": [
-        "--directory",
-        "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics",
-        "run",
-        "server.py"
+        "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics/server.py"
       ],
       "env": {
         "JULIA_EXECUTABLE": "/Users/pbotin/.juliaup/bin/julia",
         "PA_PROJECT_PATH": "/Users/pbotin/Documents/GPAC/Models/PowerAnalytics",
         "PA_RESULTS_DIR": "/Users/pbotin/Documents/GPAC/Models/PowerAnalytics",
-        "PA_SCRIPT_TIMEOUT": "600",
+        "PA_SCRIPT_TIMEOUT": "300",
         "PA_SYSIMAGE_PATH": "/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics/pa_sysimage.so"
       }
     }

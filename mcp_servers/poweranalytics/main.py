@@ -2,7 +2,7 @@
 """Is this file necessary? """
 """Entry point for the PSI Simulation MCP server."""
 
-from poweranalytics import main
+from mcp_servers.poweranalytics.server import main
 
 if __name__ == "__main__":
     main()
