@@ -164,6 +164,83 @@ async def test_refresh_api_index(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Lifespan tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lifespan_autogenerates_when_files_missing(monkeypatch, tmp_path):
+    """Lifespan auto-generates resource files when missing and sysimage is present."""
+    sysimage = tmp_path / "sysimage.so"
+    sysimage.write_bytes(b"\x00" * 10)
+    monkeypatch.setattr(server, "SYSIMAGE_PATH", str(sysimage))
+    monkeypatch.setattr(server, "_RESOURCES_DIR", tmp_path)
+
+    call_count = 0
+
+    async def fake_run_julia(script, project_path=None):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "exit_code": 0,
+            "stdout": "## PA\n- `func1` [Function]: desc\n",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+
+    async with server._lifespan(None):
+        pass
+
+    assert call_count == 2  # one for api index, one for component types
+    assert (tmp_path / "api_index.md").exists()
+    assert (tmp_path / "component_types.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_skips_when_files_exist(monkeypatch, tmp_path):
+    """Lifespan does not call Julia if resource files already exist."""
+    (tmp_path / "api_index.md").write_text("existing index")
+    (tmp_path / "component_types.md").write_text("existing types")
+    monkeypatch.setattr(server, "_RESOURCES_DIR", tmp_path)
+
+    call_count = 0
+
+    async def fake_run_julia(script, project_path=None):
+        nonlocal call_count
+        call_count += 1
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+
+    async with server._lifespan(None):
+        pass
+
+    assert call_count == 0  # Julia never called
+
+
+@pytest.mark.asyncio
+async def test_lifespan_skips_when_no_sysimage(monkeypatch, tmp_path):
+    """Lifespan does not attempt Julia if sysimage is missing (slow path)."""
+    monkeypatch.setattr(server, "SYSIMAGE_PATH", "")
+    monkeypatch.setattr(server, "_RESOURCES_DIR", tmp_path)
+
+    call_count = 0
+
+    async def fake_run_julia(script, project_path=None):
+        nonlocal call_count
+        call_count += 1
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+
+    async with server._lifespan(None):
+        pass
+
+    assert call_count == 0  # Julia never called without sysimage
+
+
+# ---------------------------------------------------------------------------
 # list_result_files tests
 # ---------------------------------------------------------------------------
 
