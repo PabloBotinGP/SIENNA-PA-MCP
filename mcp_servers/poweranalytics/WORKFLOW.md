@@ -155,11 +155,17 @@ If Julia fails at startup (wrong path, missing packages), the server falls back 
 | `poweranalytics://api-index` | One-line summary of all exported symbols | ~2-3 KB |
 | `poweranalytics://component-types` | PowerSystems.jl component type hierarchy | ~1-2 KB |
 
-### Prompts (workflow templates)
+### Prompts (master + 4 specialized sub-prompts)
 
-| Prompt | Purpose |
-|--------|---------|
-| `analyze_simulation` | Full 7-step orchestration workflow with worked example |
+| Prompt | Purpose | When Used |
+|--------|---------|-----------|
+| `analyze_simulation` | Master orchestration — the 7-step workflow with worked example | Entry point for every analysis task |
+| `julia_coding_guide` | Script structure, imports, DataFrame conventions, common pitfalls | Step 5 (before writing Julia code) |
+| `julia_error_handling` | Reading errors, retry strategy, common PowerAnalytics pitfalls | Step 5 (when a script fails) |
+| `output_saving_conventions` | File naming, directory structure, when to save vs print | Step 6 (saving results) |
+| `results_presentation` | Units, precision, summarization rules, power systems context | Step 7 (presenting to user) |
+
+The master prompt references the sub-prompts by name. The LLM reads each one when it reaches the relevant step, keeping context usage efficient — only the guidance needed for the current step is loaded.
 
 ---
 

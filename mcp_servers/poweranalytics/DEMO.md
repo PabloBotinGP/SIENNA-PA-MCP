@@ -1,6 +1,7 @@
 # PowerAnalytics MCP Server — Interactive Demo
 
-This document shows a realistic interaction between an LLM and the PowerAnalytics MCP server.
+This document shows a realistic interaction between an LLM and the PowerAnalytics MCP server
+using the dynamic agentic workflow.
 
 ---
 
@@ -21,9 +22,6 @@ Both were simulated using PowerSimulations.jl unit commitment ("UC") model.
 Check if the Julia environment is set up correctly.
 ```
 
-**LLM reasoning:**
-The user wants to verify the setup. I should use the `check_julia_environment` tool.
-
 **LLM action:**
 ```
 Tool: check_julia_environment()
@@ -38,13 +36,11 @@ Project: /Users/pbotin/julia/projects/poweranalytics
 ```
 
 **LLM response to user:**
-```
-✓ Julia environment is ready. Julia 1.10.2 with PowerAnalytics.jl is loaded.
-```
+> Julia environment is ready. Julia 1.10.2 with PowerAnalytics.jl is loaded.
 
 ---
 
-## Interaction 2: Get thermal generation time series
+## Interaction 2: Thermal generation analysis (full 7-step workflow)
 
 **User prompt:**
 ```
@@ -52,103 +48,103 @@ Obtain the generation time series for each individual thermal component of the s
 ```
 
 **LLM reasoning:**
-- The user wants thermal generator output time series
-- PowerSystems.jl component type is `ThermalStandard`
-- I should use the high-level `get_active_power_timeseries` tool
-- The results are in `_simulation_results_RTS`
-- The problem name is "UC" (unit commitment)
-- First, let me check the API reference
+The user wants thermal generator output time series. Let me follow the 7-step workflow.
+
+### Step 1: Check environment (already done above)
+
+### Step 2: Read API index
 
 **LLM reads resource:**
 ```
-Resource: poweranalytics://api-reference
+Resource: poweranalytics://api-index
 ```
-Returns function signatures and usage patterns.
+
+Returns one-line summaries of all exported symbols. The LLM identifies:
+- `create_problem_results_dict` — loads simulation results
+- `make_selector` — creates component selector
+- `calc_active_power` — computes active power time series
+
+### Step 3: Read component types
+
+**LLM reads resource:**
+```
+Resource: poweranalytics://component-types
+```
+
+Identifies `ThermalStandard` as the concrete type for thermal generators.
+
+### Step 4: Get docstrings
 
 **LLM action:**
 ```
-Tool: get_active_power_timeseries(
-  results_dir="_simulation_results_RTS",
-  problem_name="UC",
-  component_type="ThermalStandard",
-  output_csv="results/thermal_generation.csv"
-)
+Tool: get_docstring("calc_active_power", "PowerAnalytics.Metrics")
+→ Returns full signature: calc_active_power(selector, results) → DataFrame
+
+Tool: get_docstring("make_selector", "PowerAnalytics")
+→ Returns full signature: make_selector(ComponentType) → ComponentSelector
 ```
 
-**Server-generated Julia script (internal):**
-```julia
-using PowerSystems
-using PowerSimulations
-using DataFrames, Dates, CSV
-using PowerAnalytics
-using PowerAnalytics.Metrics
+### Step 5: Write and execute Julia script
 
-# Load simulation results
+**LLM action:**
+```
+Tool: run_julia_script(script="""
+using PowerSystems, PowerSimulations, StorageSystemsSimulations
+using HydroPowerSimulations, DataFrames, Dates, CSV
+using PowerAnalytics, PowerAnalytics.Metrics
+
 results_all = create_problem_results_dict("_simulation_results_RTS", "UC"; populate_system = true)
-
-# Select scenario (first one by default)
 scenario_key = first(keys(results_all))
 println("Using scenario: ", scenario_key)
 results_uc = results_all[scenario_key]
 
-# Create selector and compute active power
 selector = make_selector(ThermalStandard)
 df = calc_active_power(selector, results_uc)
 
-# Output
 println("Shape: ", size(df))
 println("Columns: ", names(df))
 println()
 println("First rows:")
-show(first(df, 5); allcols = true)
-println()
-println("Last rows:")
-show(last(df, 5); allcols = true)
+show(stdout, "text/plain", first(df, 5))
 println()
 
-CSV.write("results/thermal_generation.csv", df)
-println("Results saved to results/thermal_generation.csv")
+mkpath("_simulation_results_RTS/results")
+CSV.write("_simulation_results_RTS/results/Scenario_1_ThermalStandard_active_power.csv", df)
+println("Saved to _simulation_results_RTS/results/Scenario_1_ThermalStandard_active_power.csv")
+""")
 ```
 
 **Server response:**
 ```
+Using scenario: Scenario_1
 Shape: (744, 77)
-Columns: [:DateTime, :ThermalStandard__322_CT_6, :ThermalStandard__321_CC_1, ..., :ThermalStandard__107_CC_1]
+Columns: [:DateTime, :ThermalStandard__322_CT_6, :ThermalStandard__321_CC_1, ...]
 
 First rows:
-744×77 DataFrame
- Row │ DateTime             ThermalStandard__322_CT_6  ThermalStandard__321_CC_1  ⋯
-─────┼──────────────────────────────────────────────────────────────────────────
-   1 │ 2020-07-01T00:00:00                        0.0                    231.667  ⋯
-   2 │ 2020-07-01T01:00:00                        0.0                    170.0    ⋯
-   3 │ 2020-07-01T02:00:00                        0.0                    170.0    ⋯
+744x77 DataFrame
+ Row | DateTime             ThermalStandard__322_CT_6  ThermalStandard__321_CC_1
+-----+--------------------------------------------------------------------------
+   1 | 2020-07-01T00:00:00                        0.0                    231.667
+   2 | 2020-07-01T01:00:00                        0.0                    170.0
+   3 | 2020-07-01T02:00:00                        0.0                    170.0
 
-Last rows:
-744×77 DataFrame
-   742 │ 2020-07-31T22:00:00                        0.0                    251.888  ⋯
-   743 │ 2020-07-31T23:00:00                        0.0                    231.667  ⋯
-   744 │ 2020-07-31T23:00:00                        0.0                    231.667  ⋯
-
-Results saved to results/thermal_generation.csv
+Saved to _simulation_results_RTS/results/Scenario_1_ThermalStandard_active_power.csv
 ```
+
+### Steps 6-7: Save and present
 
 **LLM response to user:**
-```
-✓ Retrieved thermal generation time series for 76 thermal units across the entire month of July 2020 (744 hours).
-
-Summary:
-- 76 individual ThermalStandard components in the system
-- Data spans 2020-07-01 to 2020-07-31 (744 hourly periods)
-- Some units (e.g., ThermalStandard__322_CT_6) are never dispatched (0 MW throughout)
-- Other units run frequently: ThermalStandard__321_CC_1 ranges 170–355 MW
-- Baseload units (e.g., ThermalStandard__121_NUCLEAR_1) run constantly at ~400 MW
-- Results saved to results/thermal_generation.csv for further analysis
-
-Key observations:
-- Peak thermal generation typically occurs in afternoon/evening hours
-- Cycling units ramp up during high-demand periods
-- Baseload nuclear unit provides constant ~400 MW supply
-```
+> Retrieved thermal generation for 76 thermal units across July 2020 (744 hours).
+>
+> Key observations:
+> - 76 individual ThermalStandard components in the system
+> - Data spans 2020-07-01 to 2020-07-31 (744 hourly periods)
+> - Some units (e.g., 322_CT_6) are never dispatched (0 MW throughout)
+> - Combined-cycle unit 321_CC_1 ranges 170-355 MW
+> - Nuclear baseload unit runs constantly at ~400 MW
+> - Peak thermal generation occurs in afternoon/evening hours
+>
+> Full data saved to `_simulation_results_RTS/results/Scenario_1_ThermalStandard_active_power.csv`
 
 ---
 
@@ -160,19 +156,14 @@ How did the increased storage capacity in Scenario 2 affect thermal generation c
 ```
 
 **LLM reasoning:**
-- I need to compare generation across scenarios
-- I should use the `compare_scenarios` prompt template first to understand the workflow
-- Then call `run_julia_script` with a custom script that handles both scenarios
-
-**LLM reads prompt:**
-```
-Prompt: compare_scenarios(component_type="ThermalStandard")
-```
+I need to compare generation across scenarios. I'll get the docstrings I need and write
+a script that processes both scenarios.
 
 **LLM action:**
 ```
 Tool: run_julia_script(script="""
-using PowerSystems, PowerSimulations, DataFrames, Dates, CSV
+using PowerSystems, PowerSimulations, StorageSystemsSimulations
+using HydroPowerSimulations, DataFrames, Dates, CSV, Statistics
 using PowerAnalytics, PowerAnalytics.Metrics
 
 results_all = create_problem_results_dict("_simulation_results_RTS", "UC"; populate_system = true)
@@ -181,207 +172,119 @@ selector = make_selector(ThermalStandard)
 thermal_by_scenario = Dict()
 for (name, results_uc) in results_all
     df = calc_active_power(selector, results_uc)
-
-    # Compute total thermal generation per timestep
-    gen_cols = names(df)[2:end]  # skip DateTime
+    gen_cols = names(df)[2:end]
     df.total_thermal = sum(eachcol(df[!, gen_cols]))
-
     thermal_by_scenario[name] = df[!, [:DateTime, :total_thermal]]
 
     println("Scenario: ", name)
     println("  Total generation range: ",
-            round(minimum(df.total_thermal); digits=1), " — ",
+            round(minimum(df.total_thermal); digits=1), " - ",
             round(maximum(df.total_thermal); digits=1), " MW")
     println("  Mean: ", round(mean(df.total_thermal); digits=1), " MW")
     println()
 end
 
-# Compare
 scenario1 = thermal_by_scenario["Scenario_1"].total_thermal
 scenario2 = thermal_by_scenario["Scenario_2"].total_thermal
 diff = scenario2 .- scenario1
-mean_reduction = mean(diff)
-
 println("Difference (Scenario 2 - Scenario 1):")
-println("  Mean change: ", round(mean_reduction; digits=1), " MW")
+println("  Mean change: ", round(mean(diff); digits=1), " MW")
 println("  Max reduction: ", round(minimum(diff); digits=1), " MW")
 println("  Max increase: ", round(maximum(diff); digits=1), " MW")
-println("  Std dev of changes: ", round(std(diff); digits=1), " MW")
 """)
 ```
 
 **Server response:**
 ```
 Scenario: Scenario_1
-  Total generation range: 8500.5 — 12000.3 MW
+  Total generation range: 8500.5 - 12000.3 MW
   Mean: 10200.7 MW
 
 Scenario: Scenario_2
-  Total generation range: 8100.2 — 11800.1 MW
+  Total generation range: 8100.2 - 11800.1 MW
   Mean: 9950.3 MW
 
 Difference (Scenario 2 - Scenario 1):
   Mean change: -250.4 MW
   Max reduction: -800.2 MW
   Max increase: 150.1 MW
-  Std dev of changes: 320.5 MW
 ```
 
 **LLM response to user:**
-```
-✓ Comparison complete. The increased storage capacity in Scenario 2 significantly reduced thermal generation:
-
-Key findings:
-1. **Average reduction:** Thermal generation was 250 MW lower (−2.5%) with increased storage
-2. **Peak reductions:** Maximum reduction of 800 MW during high-demand periods
-3. **Night hours:** Some hours show slight increases (+150 MW) where storage supplies demand
-4. **Variability:** Changes in thermal output vary by time of day (±320 MW std dev)
-
-Economic impact:
-- Reduced thermal generation typically means lower operating costs
-- The storage facility absorbs peak loads and supplies them during lower-cost periods
-- Nuclear baseload units still operate at full capacity (not affected by storage)
-- Peaking units (CTs) are displaced more often in Scenario 2
-
-Conclusion:
-The increased energy reservoir capacity provides 250 MW of effective displacement of thermal generation,
-improving system economics and likely reducing emissions (depending on coal/gas mix).
-```
+> The increased storage capacity in Scenario 2 significantly reduced thermal generation:
+>
+> | Metric | Scenario 1 | Scenario 2 | Change |
+> |--------|-----------|-----------|--------|
+> | Mean thermal | 10,200.7 MW | 9,950.3 MW | -250.4 MW (-2.5%) |
+> | Peak thermal | 12,000.3 MW | 11,800.1 MW | -200.2 MW (-1.7%) |
+>
+> - Average reduction of 250 MW from increased storage capacity
+> - Maximum displacement of 800 MW during peak demand hours
+> - Some hours show slight increases (+150 MW) where storage charges
+> - Nuclear baseload units unaffected; peaking CTs displaced most
 
 ---
 
-## Interaction 4: Discover result files
+## Interaction 4: Discover a new metric dynamically
 
 **User prompt:**
 ```
-What result files are available?
+What is the capacity factor of each renewable generator?
+```
+
+**LLM reasoning:**
+I see `calc_capacity_factor` in the API index. Let me get its docstring and write a script.
+
+**LLM action:**
+```
+Tool: get_docstring("calc_capacity_factor", "PowerAnalytics.Metrics")
+→ Returns full docstring with signature and parameters
 ```
 
 **LLM action:**
 ```
-Tool: list_result_files(directory="_simulation_results_RTS")
-```
-
-**Server response:**
-```
-Files in _simulation_results_RTS (pattern: *):
-  Scenario_1/simulation_store.h5  (245.3 MB)
-  Scenario_1/system_snapshots.h5  (15.2 MB)
-  Scenario_2/simulation_store.h5  (248.1 MB)
-  Scenario_2/system_snapshots.h5  (15.4 MB)
-  results/thermal_generation.csv  (2.1 MB)
-  results/Scenario_1_ThermalStandard_active_power.csv  (1.2 MB)
-  results/Scenario_2_ThermalStandard_active_power.csv  (1.3 MB)
-```
-
-**LLM response:**
-```
-✓ Available files:
-
-Simulation results (binary HDF5):
-- Scenario_1/ and Scenario_2/: Complete simulation outputs (simulation_store.h5)
-- System definitions: PowerSystems.jl snapshots (system_snapshots.h5)
-
-Exported analysis:
-- thermal_generation.csv: Thermal unit output time series
-- Scenario-specific thermal results: 1.2–1.3 MB each
-```
-
----
-
-## Interaction 5: Custom analysis (escape hatch)
-
-**User prompt:**
-```
-What's the average dispatch cost across all generators? And which thermal units have the highest average output?
-```
-
-**LLM reasoning:**
-- Cost data and dispatch optimization details aren't exposed by the high-level tool
-- I need to use `run_julia_script` with a custom script to access auxiliary variables
-- I'll read the API reference first to understand what's available
-
-**LLM reads resource:**
-```
-Resource: poweranalytics://api-reference
-```
-
-**LLM action (generates custom script):**
-```
 Tool: run_julia_script(script="""
-using PowerSystems, PowerSimulations, DataFrames, Dates
+using PowerSystems, PowerSimulations, StorageSystemsSimulations
+using HydroPowerSimulations, DataFrames, Dates, CSV
 using PowerAnalytics, PowerAnalytics.Metrics
 
 results_all = create_problem_results_dict("_simulation_results_RTS", "UC"; populate_system = true)
-results_uc = first(values(results_all))
+results_uc = results_all[first(keys(results_all))]
 
-# Get thermal generation
-selector = make_selector(ThermalStandard)
-gen_df = calc_active_power(selector, results_uc)
+selector = make_selector(RenewableDispatch)
+df = calc_capacity_factor(selector, results_uc)
 
-# Compute average generation per unit
-gen_cols = names(gen_df)[2:end]
-avg_gen = vec(mean.(eachcol(gen_df[!, gen_cols])))
-top_units = sortperm(avg_gen; rev=true)[1:5]
-
-println("Top 5 thermal units by average generation:")
-for (i, idx) in enumerate(top_units)
-    unit_name = gen_cols[idx]
-    println("$(i). $unit_name: $(round(avg_gen[idx]; digits=1)) MW")
-end
-
-# Note: Dispatch costs from dual variables require accessing
-# the optimization problem auxiliary variables, which are available
-# but require deeper PowerSimulations.jl API knowledge
+println("Capacity factors:")
+show(stdout, "text/plain", df; allcols=true)
 println()
-println("Note: Detailed dispatch cost data requires direct access to")
-println("optimization solver dual variables. Use PowerSimulations.jl API to query.")
+
+mkpath("_simulation_results_RTS/results")
+CSV.write("_simulation_results_RTS/results/Scenario_1_RenewableDispatch_capacity_factor.csv", df)
+println("Saved to _simulation_results_RTS/results/Scenario_1_RenewableDispatch_capacity_factor.csv")
 """)
 ```
 
-**Server response:**
-```
-Top 5 thermal units by average generation:
-1. ThermalStandard__121_NUCLEAR_1: 398.5 MW
-2. ThermalStandard__321_CC_1: 245.2 MW
-3. ThermalStandard__315_STEAM_1: 156.8 MW
-4. ThermalStandard__123_STEAM_2: 148.3 MW
-5. ThermalStandard__102_STEAM_4: 142.1 MW
+**LLM response to user:**
+> The renewable fleet has an average capacity factor of 28.3%.
+> Wind generators range from 22% to 35%, while solar peaks at 26%.
+> Generator 'Wind_Farm_3' has the highest CF at 34.7%.
+>
+> Full data saved to `_simulation_results_RTS/results/Scenario_1_RenewableDispatch_capacity_factor.csv`
 
-Note: Detailed dispatch cost data requires direct access to
-optimization solver dual variables. Use PowerSimulations.jl API to query.
-```
-
-**LLM response:**
-```
-✓ Analysis complete.
-
-Top thermal generators (by average dispatch):
-1. **Nuclear (121):** 398.5 MW — runs as baseload, nearly constant output
-2. **Combined cycle (321):** 245.2 MW — primary intermediate load unit
-3. **Steam units (315, 123, 102):** 156–148 MW — fill peak/shoulder loads
-
-Dispatch cost analysis:
-The high-level tools don't directly expose cost data. To get detailed dispatch costs
-per unit, you would need to:
-1. Access the PowerSimulations.jl optimization dual variables
-2. Query the HDF5 store directly for constraint shadow prices
-
-Would you like me to write a custom script using PowerSimulations.jl to extract that information?
-```
+**Note:** No `calc_capacity_factor` tool was coded in Python. The LLM discovered it
+from the auto-generated API index and learned its signature from the docstring.
 
 ---
 
 ## Summary
 
-This demo shows the three levels of interaction:
+This demo shows the dynamic agentic workflow:
 
-1. **High-level tools** (Option C): `get_active_power_timeseries` — the LLM passes parameters, tool generates script
-2. **Template prompts** (Option B): `analyze_generation`, `compare_scenarios` — guide the LLM, reduce hallucination
-3. **Escape hatch** (Option A): `run_julia_script` — for custom analysis beyond the high-level tools
+1. **Discover** — LLM reads the API index to find relevant functions
+2. **Learn** — LLM pulls docstrings to understand exact signatures
+3. **Compose** — LLM writes Julia scripts tailored to the task
+4. **Execute** — LLM runs scripts and handles errors
+5. **Present** — LLM summarizes with units and power systems context
 
-The workflow prevents hallucination by:
-- Starting with high-level, validated tools for common queries
-- Providing resources (API reference, component types) before the LLM writes custom code
-- Using templates to guide standard analyses
-- Only allowing raw Julia code when necessary
+No task-specific tools are needed in Python. The LLM adapts to any analysis that
+PowerAnalytics.jl supports.

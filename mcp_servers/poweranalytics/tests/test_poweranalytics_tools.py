@@ -80,54 +80,87 @@ async def test_check_environment_fail(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# get_active_power_timeseries tests
+# get_docstring tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_get_active_power_timeseries_generates_correct_script(monkeypatch):
-    captured_scripts = []
-
+async def test_get_docstring_success(monkeypatch):
     async def fake_run_julia(script, project_path=None):
-        captured_scripts.append(script)
-        return {"exit_code": 0, "stdout": "Shape: (744, 77)\n", "stderr": ""}
-
-    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
-    result = await server.get_active_power_timeseries(
-        results_dir="_simulation_results_RTS",
-        problem_name="UC",
-        component_type="ThermalStandard",
-        scenario="Scenario_1",
-    )
-    assert "Shape:" in result
-    script = captured_scripts[0]
-    assert "create_problem_results_dict" in script
-    assert "ThermalStandard" in script
-    assert "calc_active_power" in script
-    assert 'results_all["Scenario_1"]' in script
-
-
-@pytest.mark.asyncio
-async def test_get_active_power_timeseries_with_csv(monkeypatch):
-    captured_scripts = []
-
-    async def fake_run_julia(script, project_path=None):
-        captured_scripts.append(script)
         return {
             "exit_code": 0,
-            "stdout": "Results saved to output.csv\n",
+            "stdout": "calc_active_power(selector, results)\n\nCompute active power.\n",
             "stderr": "",
         }
 
     monkeypatch.setattr(server, "_run_julia", fake_run_julia)
-    result = await server.get_active_power_timeseries(
-        results_dir="_results",
-        problem_name="UC",
-        component_type="RenewableDispatch",
-        output_csv="output.csv",
-    )
-    assert "CSV.write" in captured_scripts[0]
-    assert "saved to output.csv" in result
+    result = await server.get_docstring("calc_active_power", "PowerAnalytics.Metrics")
+    assert "calc_active_power" in result
+    assert "Compute active power" in result
+
+
+@pytest.mark.asyncio
+async def test_get_docstring_invalid_symbol():
+    result = await server.get_docstring("not-valid!", "PowerAnalytics")
+    assert "Error" in result
+    assert "Invalid symbol name" in result
+
+
+@pytest.mark.asyncio
+async def test_get_docstring_invalid_module():
+    result = await server.get_docstring("calc_active_power", "SomeRandomModule")
+    assert "Error" in result
+    assert "Unknown module" in result
+
+
+@pytest.mark.asyncio
+async def test_get_docstring_not_found(monkeypatch):
+    async def fake_run_julia(script, project_path=None):
+        return {
+            "exit_code": 0,
+            "stdout": "Symbol 'nonexistent_func' not found in PowerAnalytics\n",
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    result = await server.get_docstring("nonexistent_func", "PowerAnalytics")
+    assert "not found" in result
+
+
+# ---------------------------------------------------------------------------
+# refresh_api_index tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_api_index(monkeypatch, tmp_path):
+    call_count = 0
+
+    async def fake_run_julia(script, project_path=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # API index script
+            return {
+                "exit_code": 0,
+                "stdout": "## PowerAnalytics\n- `func1` [Function]: Does stuff\n- `func2` [Function]: More stuff\n",
+                "stderr": "",
+            }
+        else:
+            # Component types script
+            return {
+                "exit_code": 0,
+                "stdout": "## Generators\n- `ThermalStandard`\n",
+                "stderr": "",
+            }
+
+    monkeypatch.setattr(server, "_run_julia", fake_run_julia)
+    monkeypatch.setattr(server, "_RESOURCES_DIR", tmp_path)
+    result = await server.refresh_api_index()
+    assert "refreshed" in result
+    assert "2 symbols" in result
+    assert (tmp_path / "api_index.md").exists()
+    assert (tmp_path / "component_types.md").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +197,40 @@ async def test_list_result_files_with_pattern(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_api_reference_resource():
-    content = server.get_api_reference()
+def test_api_index_resource(tmp_path, monkeypatch):
+    """API index resource reads from file when available."""
+    resources_dir = tmp_path / "resources"
+    resources_dir.mkdir()
+    (resources_dir / "api_index.md").write_text("## PowerAnalytics\n- `func1` [Function]: test\n")
+    monkeypatch.setattr(server, "_RESOURCES_DIR", resources_dir)
+    content = server.get_api_index()
+    assert "func1" in content
+
+
+def test_api_index_resource_fallback(monkeypatch):
+    """API index resource falls back to hardcoded text when file missing."""
+    monkeypatch.setattr(server, "_RESOURCES_DIR", Path("/nonexistent/path"))
+    content = server.get_api_index()
     assert "create_problem_results_dict" in content
-    assert "make_selector" in content
-    assert "calc_active_power" in content
+    assert "fallback" in content.lower()
 
 
-def test_component_types_resource():
+def test_component_types_resource(tmp_path, monkeypatch):
+    """Component types resource reads from file when available."""
+    resources_dir = tmp_path / "resources"
+    resources_dir.mkdir()
+    (resources_dir / "component_types.md").write_text("## Generators\n- `ThermalStandard`\n")
+    monkeypatch.setattr(server, "_RESOURCES_DIR", resources_dir)
     content = server.get_component_types()
     assert "ThermalStandard" in content
-    assert "EnergyReservoirStorage" in content
+
+
+def test_component_types_resource_fallback(monkeypatch):
+    """Component types resource falls back to hardcoded text when file missing."""
+    monkeypatch.setattr(server, "_RESOURCES_DIR", Path("/nonexistent/path"))
+    content = server.get_component_types()
+    assert "ThermalStandard" in content
+    assert "fallback" in content.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +238,51 @@ def test_component_types_resource():
 # ---------------------------------------------------------------------------
 
 
-def test_analyze_generation_prompt():
-    prompt = server.analyze_generation(component_type="HydroDispatch")
-    assert "HydroDispatch" in prompt
-    assert "get_active_power_timeseries" in prompt
+def test_analyze_simulation_prompt():
+    prompt = server.analyze_simulation(
+        task_description="Analyze thermal generation",
+        results_dir="_simulation_results_RTS",
+        problem_name="UC",
+    )
+    assert "Analyze thermal generation" in prompt
+    assert "7-Step Workflow" in prompt
+    assert "check_julia_environment" in prompt
+    assert "get_docstring" in prompt
+    assert "run_julia_script" in prompt
+    assert "julia_coding_guide" in prompt
+    assert "julia_error_handling" in prompt
+    assert "results_presentation" in prompt
+    assert "_simulation_results_RTS" in prompt
 
 
-def test_compare_scenarios_prompt():
-    prompt = server.compare_scenarios(component_type="EnergyReservoirStorage")
-    assert "EnergyReservoirStorage" in prompt
-    assert "create_problem_results_dict" in prompt
+def test_julia_coding_guide_prompt():
+    prompt = server.julia_coding_guide()
+    assert "using PowerAnalytics" in prompt
+    assert "DataFrame" in prompt
+    assert "preamble" in prompt.lower()
+    assert "do NOT" in prompt.lower() or "What NOT to Do" in prompt
+
+
+def test_julia_error_handling_prompt():
+    prompt = server.julia_error_handling()
+    assert "MethodError" in prompt
+    assert "retry" in prompt.lower() or "3" in prompt
+    assert "LoadError" in prompt or "UndefVarError" in prompt
+
+
+def test_output_saving_conventions_prompt():
+    prompt = server.output_saving_conventions(results_dir="_simulation_results_RTS")
+    assert "_simulation_results_RTS" in prompt
+    assert "csv" in prompt.lower()
+    assert "Naming Convention" in prompt or "naming" in prompt.lower()
+
+
+def test_results_presentation_prompt():
+    prompt = server.results_presentation()
+    assert "MW" in prompt
+    assert "MWh" in prompt
+    assert "units" in prompt.lower()
+    assert "summary" in prompt.lower() or "summariz" in prompt.lower()
 
 
 # ---------------------------------------------------------------------------

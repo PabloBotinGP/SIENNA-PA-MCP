@@ -12,7 +12,20 @@ This guide explains how to register and use the PowerAnalytics MCP server in you
 3. **Simulation results** directory with results from PowerSimulations.jl
 4. **MCP CLI** installed: `pip install mcp[cli]` or `uv pip install mcp[cli]`
 
-## 1. Register the Server in MCP
+## 1. Generate the API Index
+
+After installing PowerAnalytics.jl, generate the API index files:
+
+```bash
+cd /path/to/SIENNA-PA-MCP/mcp_servers/poweranalytics
+python generate_index.py
+```
+
+This creates `resources/api_index.md` and `resources/component_types.md` from the
+installed Julia packages. If you skip this step, the server will use a static fallback
+with a reduced set of symbols.
+
+## 2. Register the Server in MCP
 
 The server entry point is `poweranalytics:main` (from `main.py`).
 
@@ -49,8 +62,9 @@ The server uses these environment variables (or defaults):
 | `PA_PROJECT_PATH` | `.` | Julia project containing PowerAnalytics.jl |
 | `PA_RESULTS_DIR` | `.` | Default directory for simulation results |
 | `PA_SCRIPT_TIMEOUT` | `300` | Max seconds for Julia scripts to run |
+| `PA_SYSIMAGE_PATH` | *(empty)* | Optional precompiled Julia sysimage |
 
-## 2. Start the Server
+## 3. Start the Server
 
 ### Option A: Via MCP Extension in Your Editor
 
@@ -67,31 +81,30 @@ cd /Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalyti
 .venv/bin/python main.py
 ```
 
-## 3. Use the Server from the LLM Chat
+## 4. Use the Server from the LLM Chat
 
-Once the server is running, you can ask the LLM to analyze simulation results. Examples:
+Once the server is running, the LLM follows a 7-step agentic workflow:
 
-### Example 1: Get thermal generation time series
+1. **Check environment** — `check_julia_environment()`
+2. **Read API index** — `poweranalytics://api-index` resource
+3. **Read component types** — `poweranalytics://component-types` resource
+4. **Get docstrings** — `get_docstring(symbol, module)` for relevant functions
+5. **Write & execute** — `run_julia_script(script)` with composed Julia code
+6. **Save results** — CSV files with descriptive names
+7. **Present analysis** — summarize with units and power systems context
 
-**You:** "Get the generation time series for each thermal component in the system."
+### Example: Thermal generation analysis
 
-**LLM does:**
-- Reads `poweranalytics://api-reference` resource
-- Calls `get_active_power_timeseries(results_dir, problem_name="UC", component_type="ThermalStandard")`
-- Returns a DataFrame with generation by thermal unit
-- Explains the results (MW values, generation patterns, baseload vs peaking behavior)
-
-### Example 2: Compare scenarios
-
-**You:** "Compare total generation across the two simulation scenarios."
+**You:** "Get the thermal generation time series for the RTS system."
 
 **LLM does:**
-- Uses the `compare_scenarios` prompt template
-- Calls `run_julia_script` with a custom script that loads both scenarios
-- Computes total generation per timestep for each
-- Returns comparison and insights
+- Reads API index, finds `calc_active_power` and `make_selector`
+- Gets docstrings for those functions
+- Writes a Julia script using `ThermalStandard` component type
+- Executes the script, saves results to CSV
+- Presents a summary with MW values and generation patterns
 
-### Example 3: Explore results
+### Example: Discover results
 
 **You:** "What result files do we have available?"
 
@@ -99,7 +112,7 @@ Once the server is running, you can ask the LLM to analyze simulation results. E
 - Calls `list_result_files(directory, pattern="*")`
 - Shows all discoverable simulation results
 
-## 4. Troubleshooting
+## 5. Troubleshooting
 
 ### Server won't start
 
@@ -111,7 +124,7 @@ Once the server is running, you can ask the LLM to analyze simulation results. E
 
 - **"Unable to load results":** Make sure `PA_RESULTS_DIR` points to the correct simulation output directory
 - **Script timeout:** Increase `PA_SCRIPT_TIMEOUT` if working with large datasets
-- **Julia syntax errors:** The LLM may have made a mistake. The error will be in the tool output. Ask the LLM to fix it.
+- **Julia syntax errors:** The LLM reads the error, fixes the script, and retries (up to 3 times)
 
 ### Check the environment
 
@@ -123,13 +136,23 @@ Use the `check_julia_environment` tool:
 - Calls `check_julia_environment()`
 - Reports Julia version, PowerAnalytics loaded status, active project
 
-## 5. Testing
+### Refresh the API index
+
+If you've updated PowerAnalytics.jl mid-session:
+
+**You:** "Refresh the API index."
+
+**LLM does:**
+- Calls `refresh_api_index()`
+- Regenerates `resources/api_index.md` and `resources/component_types.md`
+
+## 6. Testing
 
 Run the test suite to verify everything works:
 
 ```bash
 cd /Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP/mcp_servers/poweranalytics
-.venv/bin/pytest tests/ -v
+PYTHONPATH=/Users/pbotin/Documents/GPAC/SIENNA_AI/SIENNA-PA-MCP .venv/bin/pytest tests/ -v
 ```
 
-All 15 tests should pass.
+All 26 tests should pass.

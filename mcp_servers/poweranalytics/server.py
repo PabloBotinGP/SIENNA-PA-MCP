@@ -1,9 +1,12 @@
 import asyncio
+import logging
 import os
 import tempfile
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration — adjust these to match the local environment
@@ -19,6 +22,160 @@ SCRIPT_TIMEOUT = int(os.environ.get("PA_SCRIPT_TIMEOUT", "300"))  # seconds
 SYSIMAGE_PATH = os.environ.get("PA_SYSIMAGE_PATH", "")  # optional precompiled sysimage
 
 # ---------------------------------------------------------------------------
+# Resources directory and fallbacks
+# ---------------------------------------------------------------------------
+_RESOURCES_DIR = Path(__file__).parent / "resources"
+
+_FALLBACK_API_INDEX = """\
+# PowerAnalytics.jl — API Index
+
+> **Note:** This is a static fallback. Run `python generate_index.py` to generate
+> the full auto-generated index from your installed PowerAnalytics.jl.
+
+## PowerAnalytics
+- `create_problem_results_dict` [Function]: Load simulation results into a dictionary
+- `make_selector` [Function]: Create a ComponentSelector for a PowerSystems.jl type
+- `ComponentSelector` [Type]: Selector for filtering components
+
+## PowerAnalytics.Metrics
+- `calc_active_power` [Function]: Compute active power time series
+- `calc_production_cost` [Function]: Compute production cost time series
+- `calc_capacity_factor` [Function]: Compute capacity factor
+"""
+
+_FALLBACK_COMPONENT_TYPES = """\
+# PowerSystems.jl Component Types
+
+> **Note:** This is a static fallback. Run `python generate_index.py` to generate
+> the full auto-generated list from your installed PowerSystems.jl.
+
+## Generators
+- `ThermalStandard`
+- `RenewableDispatch`
+- `RenewableNonDispatch`
+- `HydroDispatch`
+- `HydroEnergyReservoir`
+
+## Storage
+- `EnergyReservoirStorage`
+
+## Electric Loads
+- `PowerLoad`
+
+## Branches
+- `Line`
+- `TapTransformer`
+"""
+
+
+def _load_resource(filename: str, fallback: str) -> str:
+    """Load a resource file from disk, falling back to hardcoded text."""
+    path = _RESOURCES_DIR / filename
+    if path.is_file():
+        return path.read_text()
+    logger.warning(
+        "Resource file %s not found. Using fallback. "
+        "Run 'python generate_index.py' to generate.",
+        path,
+    )
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# Julia scripts for index generation (shared with generate_index.py)
+# ---------------------------------------------------------------------------
+
+API_INDEX_SCRIPT = """\
+using PowerSystems
+using PowerSimulations
+using StorageSystemsSimulations
+using HydroPowerSimulations
+using DataFrames
+using Dates
+using CSV
+using PowerAnalytics
+using PowerAnalytics.Metrics
+
+modules = [
+    ("PowerAnalytics", PowerAnalytics),
+    ("PowerAnalytics.Metrics", PowerAnalytics.Metrics),
+]
+
+# Check if Selectors submodule exists
+if isdefined(PowerAnalytics, :Selectors)
+    push!(modules, ("PowerAnalytics.Selectors", PowerAnalytics.Selectors))
+end
+
+for (mod_name, mod) in modules
+    println("## ", mod_name)
+    println()
+    for name in sort(names(mod; all=false))
+        name == Symbol(mod_name) && continue
+        name == Symbol(split(mod_name, ".")[end]) && continue
+        obj = getfield(mod, name)
+        doc_str = string(Base.doc(obj))
+        # Extract first meaningful line
+        lines = filter(!isempty, split(doc_str, "\\n"))
+        first_line = isempty(lines) ? "No documentation" : strip(lines[1])
+        # Truncate long lines
+        if length(first_line) > 120
+            first_line = first_line[1:117] * "..."
+        end
+        kind = if obj isa Type
+            "Type"
+        elseif obj isa Function
+            "Function"
+        else
+            "Const"
+        end
+        println("- `", name, "` [", kind, "]: ", first_line)
+    end
+    println()
+end
+"""
+
+COMPONENT_TYPES_SCRIPT = """\
+using PowerSystems
+using InteractiveUtils
+
+println("# PowerSystems.jl Component Types")
+println()
+println("Concrete component types available for use with `make_selector()`:")
+println()
+
+abstract_types = [
+    ("Generators", Generator),
+    ("Storage", Storage),
+    ("Electric Loads", ElectricLoad),
+    ("Branches", Branch),
+]
+
+for (label, abstract_type) in abstract_types
+    println("## ", label)
+    concrete_types = []
+    for T in subtypes(abstract_type)
+        if isconcretetype(T)
+            push!(concrete_types, nameof(T))
+        end
+        for CT in subtypes(T)
+            if isconcretetype(CT)
+                push!(concrete_types, nameof(CT))
+            end
+            for CCT in subtypes(CT)
+                if isconcretetype(CCT)
+                    push!(concrete_types, nameof(CCT))
+                end
+            end
+        end
+    end
+    for name in sort(concrete_types)
+        println("- `", name, "`")
+    end
+    println()
+end
+"""
+
+# ---------------------------------------------------------------------------
 # Initialize FastMCP server
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
@@ -32,19 +189,19 @@ mcp = FastMCP(
 
     Workflow:
     1. Use check_julia_environment to verify the setup is correct.
-    2. Use high-level tools (get_active_power_timeseries) for common queries — these
-       generate and execute correct Julia scripts internally.
-    3. Use run_julia_script only for custom analysis not covered by the high-level tools.
-    4. Use list_result_files to discover available simulation results and output files.
-    5. Read the poweranalytics://api-reference and poweranalytics://component-types
-       resources before writing custom Julia code.
+    2. Read the poweranalytics://api-index resource to discover available functions.
+    3. Read the poweranalytics://component-types resource to discover component types.
+    4. Use get_docstring to pull full documentation for specific functions.
+    5. Use run_julia_script to execute Julia code you compose from the docs.
+    6. Use list_result_files to discover available simulation results and output files.
 
-    When explaining results:
-    - Provide context in terms of power system operations and economics.
-    - Include units (MW, MWh, $/MWh, etc.) with all numeric values.
-    - Summarize trends and highlight noteworthy observations.
+    Read the analyze_simulation prompt for the complete 7-step workflow.
+    Read julia_coding_guide before writing Julia scripts.
+    Read julia_error_handling when a script fails.
+    Read output_saving_conventions before saving results.
+    Read results_presentation before presenting analysis to the user.
 
-    If a script fails, read the error message, fix the script, and retry.
+    If a script fails, read the error message, fix the script, and retry (max 3 attempts).
     """,
 )
 
@@ -164,75 +321,81 @@ println("Project: ", Base.active_project())
 
 
 @mcp.tool()
-async def get_active_power_timeseries(
-    results_dir: str,
-    problem_name: str,
-    component_type: str,
-    output_csv: str | None = None,
-    scenario: str | None = None,
-    project_path: str | None = None,
+async def get_docstring(
+    symbol_name: str, module_name: str = "PowerAnalytics"
 ) -> str:
-    """Get active power generation time series for a component type.
+    """Get the full Julia docstring for a specific symbol.
 
-    Loads simulation results, creates a ComponentSelector for the given type,
-    computes calc_active_power, and returns (or saves) the resulting DataFrame.
+    Use this to read detailed documentation (signature, arguments, return type,
+    examples) for functions discovered in the poweranalytics://api-index resource.
 
     Args:
-        results_dir: Path to the directory containing simulation results
-            (relative to the Julia project root or absolute).
-        problem_name: Name of the decision model (e.g. "UC" for unit commitment).
-        component_type: PowerSystems.jl component type (e.g. "ThermalStandard",
-            "RenewableDispatch", "HydroDispatch", "EnergyReservoirStorage").
-        output_csv: Optional path to save the results as CSV. If not provided,
-            the first and last rows are printed to stdout.
-        scenario: Optional scenario name to filter (e.g. "Scenario_1"). If not
-            provided, uses the first scenario found.
-        project_path: Optional Julia project path. Defaults to PA_PROJECT_PATH.
+        symbol_name: Name of the Julia symbol (e.g. "calc_active_power", "make_selector").
+        module_name: Module containing the symbol. One of: "PowerAnalytics",
+            "PowerAnalytics.Metrics", "PowerAnalytics.Selectors".
     """
-    save_block = ""
-    if output_csv:
-        save_block = f"""
-CSV.write("{output_csv}", df)
-println("Results saved to {output_csv}")
-"""
+    # Input validation
+    if not symbol_name.isidentifier():
+        return f"Error: Invalid symbol name '{symbol_name}'. Must be a valid Julia identifier."
 
-    scenario_block = ""
-    if scenario:
-        scenario_block = f'results_uc = results_all["{scenario}"]'
-    else:
-        scenario_block = (
-            "scenario_key = first(keys(results_all))\n"
-            'println("Using scenario: ", scenario_key)\n'
-            "results_uc = results_all[scenario_key]"
+    allowed_modules = {
+        "PowerAnalytics",
+        "PowerAnalytics.Metrics",
+        "PowerAnalytics.Selectors",
+    }
+    if module_name not in allowed_modules:
+        return (
+            f"Error: Unknown module '{module_name}'. "
+            f"Allowed modules: {', '.join(sorted(allowed_modules))}"
         )
 
     script = f"""{JULIA_PREAMBLE}
-
-# Load simulation results
-results_all = create_problem_results_dict("{results_dir}", "{problem_name}"; populate_system = true)
-
-# Select scenario
-{scenario_block}
-
-# Create selector and compute active power
-selector = make_selector({component_type})
-df = calc_active_power(selector, results_uc)
-
-# Output
-println("Shape: ", size(df))
-println("Columns: ", names(df))
-println()
-println("First rows:")
-show(first(df, 5); allcols = true)
-println()
-println()
-println("Last rows:")
-show(last(df, 5); allcols = true)
-println()
-{save_block}
+mod = {module_name}
+sym = Symbol("{symbol_name}")
+if isdefined(mod, sym)
+    obj = getfield(mod, sym)
+    println(Base.doc(obj))
+else
+    println("Symbol '{symbol_name}' not found in {module_name}")
+end
 """
-    result = await _run_julia(script, project_path)
-    return _format_result(result)
+    result = await _run_julia(script)
+    if result["exit_code"] == 0:
+        return result["stdout"].strip()
+    return f"Error retrieving docstring:\n{_format_result(result)}"
+
+
+@mcp.tool()
+async def refresh_api_index() -> str:
+    """Regenerate the API index and component types from the installed Julia packages.
+
+    Runs the same Julia scripts as generate_index.py, overwrites the
+    resources/*.md files, and returns the updated symbol count.
+    Use this after updating PowerAnalytics.jl without restarting the server.
+    """
+    _RESOURCES_DIR.mkdir(exist_ok=True)
+    errors = []
+
+    # Generate API index
+    result = await _run_julia(API_INDEX_SCRIPT)
+    if result["exit_code"] == 0:
+        (_RESOURCES_DIR / "api_index.md").write_text(result["stdout"])
+    else:
+        errors.append(f"API index generation failed:\n{_format_result(result)}")
+
+    # Generate component types
+    result = await _run_julia(COMPONENT_TYPES_SCRIPT)
+    if result["exit_code"] == 0:
+        (_RESOURCES_DIR / "component_types.md").write_text(result["stdout"])
+    else:
+        errors.append(f"Component types generation failed:\n{_format_result(result)}")
+
+    if errors:
+        return "Partial failure:\n" + "\n".join(errors)
+
+    api_text = (_RESOURCES_DIR / "api_index.md").read_text()
+    symbol_count = api_text.count("\n- ")
+    return f"API index refreshed. {symbol_count} symbols indexed."
 
 
 @mcp.tool()
@@ -266,80 +429,16 @@ async def list_result_files(directory: str | None = None, pattern: str = "*") ->
 # ===================================================================
 
 
-@mcp.resource("poweranalytics://api-reference")
-def get_api_reference() -> str:
-    """PowerAnalytics.jl public API reference — key functions and usage patterns."""
-    return """\
-# PowerAnalytics.jl — API Reference
-
-## Loading Results
-- `create_problem_results_dict(results_dir, problem_name; populate_system=true)`
-  Loads all scenario results from `results_dir`. Returns a SortedDict where keys are
-  scenario folder names (e.g. "Scenario_1") and values are SimulationProblemResults.
-  `problem_name` must match the name used when creating the DecisionModel (e.g. "UC").
-
-## Component Selectors
-- `make_selector(ComponentType)`
-  Creates a ComponentSelector for a PowerSystems.jl component type.
-  By default selects each individual (available) component of that type.
-  Example: `make_selector(ThermalStandard)`
-
-## Metrics (from PowerAnalytics.Metrics)
-- `calc_active_power(selector, results) -> DataFrame`
-  Returns active power time series. Each column is one component; first column is DateTime.
-
-## Required Packages
-```julia
-using PowerSystems
-using PowerSimulations
-using StorageSystemsSimulations
-using HydroPowerSimulations
-using DataFrames
-using Dates
-using CSV
-using PowerAnalytics
-using PowerAnalytics.Metrics
-```
-
-## Common Component Types (from PowerSystems.jl)
-- ThermalStandard — conventional thermal generators
-- RenewableDispatch — dispatchable renewable generators
-- RenewableNonDispatch — non-dispatchable renewables (fixed output)
-- HydroDispatch — run-of-river hydro
-- HydroEnergyReservoir — hydro with storage reservoir
-- EnergyReservoirStorage — battery / energy storage
-- PowerLoad — system loads
-- Line — transmission lines
-- TapTransformer — tap-changing transformers
-"""
+@mcp.resource("poweranalytics://api-index")
+def get_api_index() -> str:
+    """Auto-generated one-line-per-symbol index of all PowerAnalytics.jl exports."""
+    return _load_resource("api_index.md", _FALLBACK_API_INDEX)
 
 
 @mcp.resource("poweranalytics://component-types")
 def get_component_types() -> str:
-    """Available PowerSystems.jl component types and their simulation formulations."""
-    return """\
-# Component Types and Formulations
-
-The following component types are available in the RTS-GMLC test system simulations.
-The formulation determines what variables/constraints are available in the results.
-
-| Component Type          | Formulation                  | Key Result Variables            |
-|-------------------------|------------------------------|---------------------------------|
-| ThermalStandard         | ThermalBasicUnitCommitment   | ActivePowerVariable, OnVariable |
-| RenewableDispatch       | RenewableFullDispatch        | ActivePowerVariable             |
-| RenewableNonDispatch    | FixedOutput                  | ActivePowerVariable             |
-| HydroDispatch           | HydroDispatchRunOfRiver      | ActivePowerVariable             |
-| HydroEnergyReservoir    | HydroDispatchRunOfRiver      | ActivePowerVariable             |
-| EnergyReservoirStorage  | StorageDispatchWithReserves  | ActivePowerVariable, EnergyVar  |
-| PowerLoad               | StaticPowerLoad              | ActivePowerVariable             |
-| Line                    | StaticBranch                 | FlowActivePowerVariable         |
-| TapTransformer          | StaticBranch                 | FlowActivePowerVariable         |
-
-## Notes
-- Only *available* components appear in results by default.
-- Use `make_selector(ComponentType)` to select all components of a type.
-- The network model used is CopperPlatePowerModel (no nodal constraints).
-"""
+    """Auto-generated PowerSystems.jl component type hierarchy."""
+    return _load_resource("component_types.md", _FALLBACK_COMPONENT_TYPES)
 
 
 # ===================================================================
@@ -348,86 +447,335 @@ The formulation determines what variables/constraints are available in the resul
 
 
 @mcp.prompt()
-def analyze_generation(
-    component_type: str = "ThermalStandard",
+def analyze_simulation(
+    task_description: str = "Analyze the simulation results",
     results_dir: str = "_simulation_results_RTS",
     problem_name: str = "UC",
 ) -> str:
-    """Template for analyzing generation time series by component type.
+    """Master orchestration prompt — the 7-step workflow for any analysis task.
 
-    Generates a ready-to-use Julia script. Fill in the parameters for your use case.
+    This is the entry point for every analysis request. It teaches the complete
+    workflow: discover API, read docs, write Julia scripts, execute, save, present.
 
     Args:
-        component_type: PowerSystems.jl component type (e.g. ThermalStandard).
-        results_dir: Path to simulation results directory.
-        problem_name: Decision model name (e.g. UC).
+        task_description: What the user wants to analyze.
+        results_dir: Path to the directory containing simulation results.
+        problem_name: Name of the decision model (e.g. "UC").
     """
     return f"""\
-Analyze the active power generation for {component_type} components.
+## Task
+{task_description}
 
-Use the get_active_power_timeseries tool with:
-- results_dir: "{results_dir}"
-- problem_name: "{problem_name}"
-- component_type: "{component_type}"
+## Simulation Context
+- Results directory: `{results_dir}`
+- Problem name: `{problem_name}`
 
-After getting the results:
-1. Identify which generators are online vs offline (zero generation).
-2. Summarize the range of generation (min/max MW) for each active generator.
-3. Note any interesting patterns (ramping, cycling, baseload behavior).
-4. If multiple scenarios are available, compare them.
+## 7-Step Workflow
 
-If you need to save results, use the output_csv parameter with a descriptive filename
-like "results/{component_type}_active_power.csv".
+Follow these steps in order:
+
+### Step 1: Check Environment
+Call `check_julia_environment()` to verify Julia and PowerAnalytics.jl are available.
+
+### Step 2: Read API Index
+Read the `poweranalytics://api-index` resource to discover available functions, types,
+and constants. Scan the index and identify which symbols are relevant to the task.
+
+### Step 3: Read Component Types
+Read the `poweranalytics://component-types` resource to identify which PowerSystems.jl
+component types are relevant (e.g. ThermalStandard, RenewableDispatch).
+
+### Step 4: Get Docstrings
+For each relevant function identified in Step 2, call `get_docstring(symbol_name, module_name)`
+to read the full signature, argument descriptions, and usage examples.
+Typically you need 1-3 docstrings per task.
+
+### Step 5: Write and Execute Julia Script
+Compose a Julia script based on the docstrings. Read the `julia_coding_guide` prompt
+for best practices on script structure and imports.
+
+Execute with `run_julia_script(script)`.
+
+If the script fails, read the `julia_error_handling` prompt, fix the issue, and retry
+(max 3 attempts).
+
+### Step 6: Save Results
+Follow the `output_saving_conventions` prompt for file naming and directory structure.
+Save DataFrames with > 10 rows to CSV. Print the saved file path.
+
+### Step 7: Analyze and Present
+Follow the `results_presentation` prompt. Summarize results with units (MW, MWh, $/MWh).
+Explain patterns in power systems context. Point to saved CSVs for full data.
+
+## Worked Example: Thermal Generation Analysis
+
+Task: "Get thermal generation for the RTS system"
+
+1. `check_julia_environment()` → OK
+2. Read `poweranalytics://api-index` → find `create_problem_results_dict`, `make_selector`, `calc_active_power`
+3. Read `poweranalytics://component-types` → identify `ThermalStandard`
+4. `get_docstring("calc_active_power", "PowerAnalytics.Metrics")` → full signature
+   `get_docstring("make_selector", "PowerAnalytics")` → selector docs
+5. Write and execute:
+```julia
+{JULIA_PREAMBLE}
+results_all = create_problem_results_dict("{results_dir}", "{problem_name}"; populate_system = true)
+results_uc = results_all[first(keys(results_all))]
+selector = make_selector(ThermalStandard)
+df = calc_active_power(selector, results_uc)
+println("Shape: ", size(df))
+println("Columns: ", names(df))
+println()
+println("First rows:")
+show(stdout, "text/plain", first(df, 5))
+println()
+CSV.write("results/Scenario_1_ThermalStandard_active_power.csv", df)
+println("Saved to results/Scenario_1_ThermalStandard_active_power.csv")
+```
+6. File saved to `results/Scenario_1_ThermalStandard_active_power.csv`
+7. Present: "76 thermal units, 744 hourly periods. Nuclear baseload at ~400 MW,
+   combined-cycle units range 170-355 MW, peaking CTs dispatched during high-demand hours."
 """
 
 
 @mcp.prompt()
-def compare_scenarios(
-    component_type: str = "ThermalStandard",
-    results_dir: str = "_simulation_results_RTS",
-    problem_name: str = "UC",
-) -> str:
-    """Template for comparing generation across scenarios.
+def julia_coding_guide() -> str:
+    """Julia code generation best practices for PowerAnalytics.jl scripts.
 
-    Args:
-        component_type: PowerSystems.jl component type.
-        results_dir: Path to simulation results directory.
-        problem_name: Decision model name.
+    Covers required imports, script structure, DataFrame conventions, type system,
+    common patterns, and what to avoid.
     """
     return f"""\
-Compare the {component_type} generation across all available scenarios.
+## Julia Coding Guide for PowerAnalytics.jl
 
-Steps:
-1. Use run_julia_script to load results and compute active power for ALL scenarios:
-
+### Required Imports (always include this preamble)
 ```julia
-{JULIA_PREAMBLE}
+{JULIA_PREAMBLE}```
 
-results_all = create_problem_results_dict("{results_dir}", "{problem_name}"; populate_system = true)
-selector = make_selector({component_type})
+### Script Structure
+Every analysis script follows this pattern:
+1. **Imports** (the preamble above)
+2. **Load results**: `create_problem_results_dict(results_dir, problem_name; populate_system=true)`
+3. **Select scenario**: `results_uc = results_all[first(keys(results_all))]`
+4. **Create selectors**: `selector = make_selector(ComponentType)`
+5. **Compute metrics**: `df = calc_some_metric(selector, results_uc)`
+6. **Output results**: print summary, save to CSV if large
 
+### DataFrame Conventions
+- First column is always `DateTime` (hourly timestamps)
+- Data columns are named `TypeName__component_name` (e.g. `ThermalStandard__321_CC_1`)
+- Access data columns: `names(df)[2:end]` (skip DateTime)
+- Total across components: `sum(eachcol(df[!, names(df)[2:end]]))`
+
+### Type System
+- **Concrete types** for selectors: `ThermalStandard`, `RenewableDispatch`, `EnergyReservoirStorage`
+- **Abstract types** for broader queries: `ThermalGen`, `RenewableGen`, `Storage`
+- When in doubt, check `poweranalytics://component-types` resource
+- Always use the concrete type with `make_selector()` unless you want all subtypes
+
+### Common Patterns
+
+**Iterate over scenarios:**
+```julia
 for (name, results_uc) in results_all
-    println("=== Scenario: ", name, " ===")
     df = calc_active_power(selector, results_uc)
-    println("Shape: ", size(df))
-
-    # Total generation per timestep
-    gen_cols = names(df)[2:end]  # skip DateTime column
-    df.total = sum(eachcol(df[!, gen_cols]))
-    println("Total generation range: ", minimum(df.total), " — ", maximum(df.total), " MW")
-    println("Mean total generation: ", round(mean(df.total); digits=2), " MW")
-    println()
-
-    CSV.write("results/$(name)_{component_type}_active_power.csv", df)
-    println("Saved to results/$(name)_{component_type}_active_power.csv")
-    println()
+    println("Scenario: ", name, " — Shape: ", size(df))
 end
 ```
 
-2. After getting results, compare:
-   - Total generation levels across scenarios
-   - Which generators change behavior between scenarios
-   - Impact on system economics (if cost data is available)
+**Aggregate across time:**
+```julia
+gen_cols = names(df)[2:end]
+avg_per_unit = [mean(df[!, col]) for col in gen_cols]
+```
+
+**Filter to specific components:**
+```julia
+# Use make_selector with specific component names
+selector = make_selector(ThermalStandard, "321_CC_1")
+```
+
+### What NOT to Do
+- Do NOT use `using Plots` or any plotting library (no display available)
+- Do NOT use `@show` — use `println()` and `show(stdout, "text/plain", df)`
+- Do NOT print entire large DataFrames — print `size(df)`, `first(df, 5)`, `last(df, 5)`
+- Do NOT hardcode paths — use the `results_dir` parameter
+
+### Handling Large Outputs
+If a DataFrame has many rows:
+```julia
+println("Shape: ", size(df))
+println("Columns: ", names(df))
+println("\\nFirst 5 rows:")
+show(stdout, "text/plain", first(df, 5))
+println("\\n\\nLast 5 rows:")
+show(stdout, "text/plain", last(df, 5))
+CSV.write("results/output.csv", df)
+println("\\nFull data saved to results/output.csv")
+```
+"""
+
+
+@mcp.prompt()
+def julia_error_handling() -> str:
+    """Guide for iterating and debugging Julia script errors.
+
+    Covers how to read Julia error messages, common PowerAnalytics pitfalls,
+    iteration strategy, and when to give up.
+    """
+    return """\
+## Julia Error Handling Guide
+
+### Reading Julia Error Messages
+
+**MethodError: no method matching func(::Type1, ::Type2)**
+- You passed wrong argument types. Check the docstring for correct signature.
+- Common cause: passing a string where a Type is expected (e.g. "ThermalStandard" instead of ThermalStandard).
+
+**LoadError: UndefVarError: `name` not defined**
+- Missing import. Add the appropriate `using` statement.
+- Check if the symbol exists in the module: read the API index resource.
+
+**ArgumentError: ...**
+- Wrong argument value. Read the full error message for expected values.
+- Common cause: wrong problem_name or results_dir path.
+
+**KeyError: key "Scenario_X" not found**
+- The scenario name doesn't exist. List available keys first:
+  `println(keys(results_all))`
+
+### Common PowerAnalytics Pitfalls
+
+1. **Wrong component type name**: Use exact names from `poweranalytics://component-types`.
+   Wrong: `Thermal`, `ThermalGenerator` — Right: `ThermalStandard`
+
+2. **Metric returns empty DataFrame**: The component type has no results in this simulation.
+   Check with `list_result_files` that the simulation ran successfully.
+
+3. **Path not found**: Relative paths resolve from `PA_PROJECT_PATH`. Use absolute paths if unsure.
+
+4. **Out of memory**: Large multi-scenario analyses can be memory-intensive.
+   Process one scenario at a time instead of loading all at once.
+
+### Iteration Strategy
+1. Read the FULL error message carefully
+2. Fix ONE error at a time
+3. Re-run the script
+4. Do NOT rewrite the entire script from scratch — modify the failing part
+5. Maximum 3 retry attempts before reporting the issue to the user
+
+### When to Ask the User
+- After 3 failed attempts with different errors
+- When the error suggests missing data or configuration issues
+- When the requested analysis is ambiguous
+"""
+
+
+@mcp.prompt()
+def output_saving_conventions(results_dir: str = "_simulation_results_RTS") -> str:
+    """Conventions for where and how to save analysis results.
+
+    Args:
+        results_dir: Base directory for simulation results (used to derive output path).
+    """
+    return f"""\
+## Output Saving Conventions
+
+### Directory Structure
+Save analysis outputs to: `{results_dir}/results/`
+
+Create the directory in your Julia script if it doesn't exist:
+```julia
+mkpath("{results_dir}/results")
+```
+
+### File Naming Convention
+`{{scenario}}_{{ComponentType}}_{{metric}}.csv`
+
+Examples:
+- `Scenario_1_ThermalStandard_active_power.csv`
+- `Scenario_2_RenewableDispatch_capacity_factor.csv`
+- `all_scenarios_EnergyReservoirStorage_energy.csv`
+
+### When to Save
+- **Always save** if the DataFrame has > 10 rows → CSV file
+- **Just print** for small summaries (< 10 rows), scalar values, or aggregated statistics
+
+### When to Just Print
+- Single numeric results: "Total cost: $1,234,567"
+- Small summary tables: capacity factors per generator (< 10 rows)
+- Comparison summaries: scenario A vs B key metrics
+
+### After Saving
+Always print the file path so the user can find it:
+```julia
+CSV.write("path/to/file.csv", df)
+println("Results saved to path/to/file.csv")
+```
+
+### Overwrite Policy
+Overwrite existing files — analyses are reproducible from simulation data.
+"""
+
+
+@mcp.prompt()
+def results_presentation() -> str:
+    """Guide for presenting analysis results to the user.
+
+    Covers units, precision, structure, comparisons, and power systems context.
+    """
+    return """\
+## Results Presentation Guide
+
+### Always Include Units
+- Power: MW (megawatts)
+- Energy: MWh or GWh (megawatt-hours, gigawatt-hours)
+- Cost: $/MWh or total $
+- Percentage: %
+- Time: hours
+
+### Structure
+1. **One-sentence summary** of the key finding
+2. **Details** with specific numbers
+3. **Context** explaining why the pattern occurs
+4. **Saved files** pointing to CSVs for full data
+
+### Numeric Precision
+- MW / MWh: 1-2 decimal places (e.g. 245.3 MW)
+- Dollar totals: 0 decimal places (e.g. $1,234,567)
+- Percentages: 1 decimal place (e.g. 12.3%)
+- Capacity factors: 1 decimal place (e.g. 34.7%)
+
+### Comparisons
+Use BOTH absolute and percentage changes:
+- "Reduced by 250 MW, a 12% decrease"
+- "Cost increased from $2.1M to $2.4M (+14%)"
+
+### Power Systems Context
+Explain WHY patterns occur:
+- Baseload units (nuclear, large coal) run constantly at high output
+- Peaking units (CTs, gas turbines) only dispatch during high-demand periods
+- Renewables have variable output driven by weather (wind speed, solar irradiance)
+- Storage charges during low-price hours and discharges during high-price hours
+- Curtailment occurs when renewable generation exceeds demand minus must-run generation
+
+### Highlight Anomalies
+Flag these if they appear:
+- Generators at 0 MW for the entire period (may indicate outage or decommitment)
+- Unexpected cost spikes (may indicate scarcity pricing)
+- Curtailment > 5% (may indicate transmission constraints or oversupply)
+- Storage cycling patterns that don't match expected arbitrage behavior
+
+### Multi-Scenario Comparisons
+- Always compare side-by-side in a markdown table
+- Note which scenario performs better and why
+- Quantify the difference in absolute and percentage terms
+
+### Do NOT
+- Dump raw DataFrames — summarize, then point to saved CSV
+- Use technical jargon without explanation
+- Present numbers without units
+- Ignore anomalies or unexpected patterns
 """
 
 
