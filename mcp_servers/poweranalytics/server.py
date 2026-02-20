@@ -21,6 +21,7 @@ RESULTS_DIR = Path(
 )  # default directory for simulation results
 SCRIPT_TIMEOUT = int(os.environ.get("PA_SCRIPT_TIMEOUT", "300"))  # seconds
 SYSIMAGE_PATH = os.environ.get("PA_SYSIMAGE_PATH", "")  # optional precompiled sysimage
+JULIA_HEAP_SIZE = os.environ.get("JULIA_MCP_MEMORY_LIMIT", "")  # e.g. "4G" → --heap-size-hint
 
 # ---------------------------------------------------------------------------
 # Resources directory and fallbacks
@@ -30,18 +31,49 @@ _RESOURCES_DIR = Path(__file__).parent / "resources"
 _FALLBACK_API_INDEX = """\
 # PowerAnalytics.jl — API Index
 
-> **Note:** This is a static fallback. Run `python generate_index.py` to generate
-> the full auto-generated index from your installed PowerAnalytics.jl.
+> **Note:** This is a static fallback. Run `python generate_index.py` or call
+> `refresh_api_index()` to generate the full auto-generated index from your
+> installed PowerAnalytics.jl.
 
 ## PowerAnalytics
-- `create_problem_results_dict` [Function]: Load simulation results into a dictionary
-- `make_selector` [Function]: Create a ComponentSelector for a PowerSystems.jl type
-- `ComponentSelector` [Type]: Selector for filtering components
+
+- `create_problem_results_dict` [Function]: Load simulation results into a Dict mapping scenario name → ProblemResults
+  - Signature: `create_problem_results_dict(results_dir, problem_name; scenarios=nothing, populate_system=false)`
+  - **Always pass `scenarios` explicitly** to avoid scanning non-simulation subdirectories.
+  - **Avoid `populate_system=true`** on memory-constrained systems — see `julia_error_handling` for the low-memory alternative.
+- `make_selector` [Function]: Create a ComponentSelector for filtering by PowerSystems.jl component type
+  - Signature: `make_selector(ComponentType)` or `make_selector(ComponentType, "name_substring")`
+- `ComponentSelector` [Type]: Selector object used by all `calc_*` metric functions
 
 ## PowerAnalytics.Metrics
-- `calc_active_power` [Function]: Compute active power time series
+
+- `calc_active_power` [Function]: Compute active power time series for selected components
+  - Signature: `calc_active_power(selector::ComponentSelector, results::IS.Results) → DataFrame`
+  - Returns DataFrame with DateTime column + one column per component (MW)
+  - Requires: `using PowerSystems` for component type argument to `make_selector`
 - `calc_production_cost` [Function]: Compute production cost time series
-- `calc_capacity_factor` [Function]: Compute capacity factor
+  - Signature: `calc_production_cost(selector::ComponentSelector, results::IS.Results) → DataFrame`
+- `calc_capacity_factor` [Function]: Compute capacity factor (generation / capacity)
+  - Signature: `calc_capacity_factor(selector::ComponentSelector, results::IS.Results) → DataFrame`
+- `calc_active_power_in` [Function]: Compute active power flowing into storage/loads
+- `calc_active_power_out` [Function]: Compute active power flowing out of storage
+- `calc_load_following_up` [Function]: Compute load following up reserve provision
+- `calc_load_following_down` [Function]: Compute load following down reserve provision
+- `calc_energy_storage` [Function]: Compute stored energy time series for storage units
+
+## PowerSimulations (lower-level fallback, no populate_system needed)
+
+Use these when PowerAnalytics metrics fail due to memory constraints:
+
+- `PowerSimulations.SimulationResults(path)` [Function]: Load simulation results from directory
+- `PowerSimulations.get_decision_problem_results(sr, problem_name)` [Function]: Get results for a specific decision problem (no populate_system)
+- `read_variable(pr, VariableType, ComponentType)` [Function]: Read a single variable as DataFrame
+  - Signature: `read_variable(pr, ActivePowerVariable, ThermalStandard)`
+  - Optional kwargs: `initial_time::DateTime`, `count::Int` (number of timesteps, NOT end time)
+  - **Note:** use `count`, not a stop time. Example: `count=7*24` for one week of hourly data.
+  - Requires: `using PowerSystems` for component type, `using PowerSimulations` for variable type
+- `list_variable_keys(pr)` [Function]: List all available (VariableType, ComponentType) pairs
+- `get_timestamps(pr)` [Function]: Return the vector of DateTime timestamps in the results
 """
 
 _FALLBACK_COMPONENT_TYPES = """\
@@ -272,18 +304,34 @@ using PowerAnalytics.Metrics
 async def _run_julia(script: str, project_path: str | None = None) -> dict:
     """Write *script* to a temp file, run it with Julia, return stdout + stderr.
 
-    The subprocess ``cwd`` is set to *project_path* so that relative paths
-    inside Julia scripts (e.g. ``_simulation_results_RTS``) resolve correctly.
+    Behaviour:
+    - ``cwd`` is set to *project_path* so relative paths resolve correctly.
+    - A ``PROJECT_DIR`` constant is injected at the top of every script so
+      scripts can reference the project root without relying on ``@__DIR__``
+      (which resolves to the temp file's directory, not the project root).
+    - If ``JULIA_MCP_MEMORY_LIMIT`` is set the ``--heap-size-hint`` flag is
+      passed so Julia triggers a graceful ``OutOfMemoryError`` instead of
+      being killed by the OS.
+    - Out-of-memory conditions are detected and returned as a structured error
+      message rather than a silent "Connection closed".
     """
     project = project_path or str(PA_PROJECT_PATH)
+
+    # Inject PROJECT_DIR so scripts don't need to rely on @__DIR__
+    preamble = f'const PROJECT_DIR = raw"{project}"\n'
+    full_script = preamble + script
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".jl", delete=False
     ) as tmp:
-        tmp.write(script)
+        tmp.write(full_script)
         tmp_path = tmp.name
 
     try:
         cmd = [JULIA_EXECUTABLE]
+        # Graceful OOM: Julia raises OutOfMemoryError instead of being SIGKILL'd
+        if JULIA_HEAP_SIZE:
+            cmd += [f"--heap-size-hint={JULIA_HEAP_SIZE}"]
         # Use precompiled sysimage if available (Phase 1 optimisation)
         sysimage = SYSIMAGE_PATH
         if sysimage and Path(sysimage).is_file():
@@ -299,17 +347,44 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=SCRIPT_TIMEOUT
         )
+        stdout_str = stdout.decode()
+        stderr_str = stderr.decode()
+
+        # Detect out-of-memory conditions (SIGKILL from OS or Julia OOM error)
+        is_oom = (
+            proc.returncode in (-9, 137)  # SIGKILL (Linux/macOS OOM killer)
+            or "OutOfMemoryError" in stderr_str
+            or "Cannot allocate memory" in stderr_str
+            or "out of memory" in stderr_str.lower()
+        )
+        if is_oom:
+            oom_hint = (
+                "Julia process ran out of memory.\n"
+                "Suggestions:\n"
+                "  1. Avoid `populate_system=true` — use `read_variable` directly (see julia_error_handling prompt).\n"
+                "  2. Process smaller time windows with `initial_time` and `count` parameters.\n"
+                "  3. Set the JULIA_MCP_MEMORY_LIMIT env var (e.g. '4G') for a graceful OOM error next time.\n"
+                "  4. Read the `julia_error_handling` prompt for the full low-memory alternative workflow.\n"
+            )
+            if stderr_str:
+                oom_hint += f"\nOriginal stderr:\n{stderr_str}"
+            return {"exit_code": proc.returncode, "stdout": stdout_str, "stderr": oom_hint}
+
         return {
             "exit_code": proc.returncode,
-            "stdout": stdout.decode(),
-            "stderr": stderr.decode(),
+            "stdout": stdout_str,
+            "stderr": stderr_str,
         }
     except asyncio.TimeoutError:
         proc.kill()
         return {
             "exit_code": -1,
             "stdout": "",
-            "stderr": f"Script timed out after {SCRIPT_TIMEOUT} seconds.",
+            "stderr": (
+                f"Script timed out after {SCRIPT_TIMEOUT} seconds "
+                f"(controlled by PA_SCRIPT_TIMEOUT env var).\n"
+                "For large datasets consider processing in smaller time chunks."
+            ),
         }
     finally:
         os.unlink(tmp_path)
@@ -401,9 +476,36 @@ mod = {module_name}
 sym = Symbol("{symbol_name}")
 if isdefined(mod, sym)
     obj = getfield(mod, sym)
-    println(Base.doc(obj))
+    doc_str = string(Base.doc(obj))
+    lines = filter(!isempty, split(doc_str, "\\n"))
+    # Heuristic: if the docstring doesn't mention the symbol name in the first
+    # few lines it likely belongs to an internal type (e.g. generated by a macro).
+    # In that case we skip the docstring and fall straight to method signatures.
+    mentions_sym = any(l -> contains(l, "{symbol_name}"), lines[1:min(4, length(lines))])
+    has_content = length(lines) >= 3
+    if has_content && mentions_sym
+        println(doc_str)
+        println()
+    end
+    # Always show concrete method signatures — indispensable for macro-generated functions
+    if obj isa Function
+        ms = methods(obj)
+        if length(ms) > 0
+            println("## Method signatures for `{symbol_name}`")
+            println()
+            for m in ms
+                println("  ", m)
+            end
+        else
+            println("No methods found for `{symbol_name}` in {module_name}.")
+        end
+    elseif !(has_content && mentions_sym)
+        # Not a function and no useful docstring — print whatever we have
+        println(doc_str)
+    end
 else
-    println("Symbol '{symbol_name}' not found in {module_name}")
+    println("Symbol `{symbol_name}` not found in {module_name}.")
+    println("Tip: check the poweranalytics://api-index resource for the correct module.")
 end
 """
     result = await _run_julia(script)
@@ -561,13 +663,18 @@ Task: "Get thermal generation for the RTS system"
 1. `check_julia_environment()` → OK
 2. Read `poweranalytics://api-index` → find `create_problem_results_dict`, `make_selector`, `calc_active_power`
 3. Read `poweranalytics://component-types` → identify `ThermalStandard`
-4. `get_docstring("calc_active_power", "PowerAnalytics.Metrics")` → full signature
+4. `get_docstring("calc_active_power", "PowerAnalytics.Metrics")` → full signature + method list
    `get_docstring("make_selector", "PowerAnalytics")` → selector docs
 5. Write and execute:
 ```julia
 {JULIA_PREAMBLE}
-results_all = create_problem_results_dict("{results_dir}", "{problem_name}"; populate_system = true)
-results_uc = results_all[first(keys(results_all))]
+# Load results — always pass scenarios explicitly to avoid scanning CSV output folders
+results_all = create_problem_results_dict(
+    "{results_dir}", "{problem_name}";
+    scenarios=["Scenario_1"],   # list actual scenario folder names
+    populate_system=true,
+)
+results_uc = results_all["Scenario_1"]
 selector = make_selector(ThermalStandard)
 df = calc_active_power(selector, results_uc)
 println("Shape: ", size(df))
@@ -576,12 +683,18 @@ println()
 println("First rows:")
 show(stdout, "text/plain", first(df, 5))
 println()
-CSV.write("results/Scenario_1_ThermalStandard_active_power.csv", df)
-println("Saved to results/Scenario_1_ThermalStandard_active_power.csv")
+# Save to a separate output directory — NEVER inside the simulation results folder
+out_path = joinpath(PROJECT_DIR, "analysis_outputs", "Scenario_1_ThermalStandard_active_power.csv")
+mkpath(dirname(out_path))
+CSV.write(out_path, df)
+println("Saved to ", out_path)
 ```
-6. File saved to `results/Scenario_1_ThermalStandard_active_power.csv`
+6. File saved to `<PROJECT_DIR>/analysis_outputs/Scenario_1_ThermalStandard_active_power.csv`
 7. Present: "76 thermal units, 744 hourly periods. Nuclear baseload at ~400 MW,
    combined-cycle units range 170-355 MW, peaking CTs dispatched during high-demand hours."
+
+> **If Step 5 fails with -32000 / OOM**, skip `populate_system` and use `read_variable` directly.
+> Read the `julia_error_handling` prompt for the complete low-memory workflow.
 """
 
 
@@ -590,23 +703,119 @@ def julia_coding_guide() -> str:
     """Julia code generation best practices for PowerAnalytics.jl scripts.
 
     Covers required imports, script structure, DataFrame conventions, type system,
-    common patterns, and what to avoid.
+    common patterns, chunked reading, and what to avoid.
     """
     return f"""\
 ## Julia Coding Guide for PowerAnalytics.jl
 
-### Required Imports (always include this preamble)
+### Standard Imports
+
+Always include this preamble at the top of every script:
+
 ```julia
 {JULIA_PREAMBLE}```
 
-### Script Structure
+> **Why each import matters:**
+> - `using PowerSystems` — required for component types like `ThermalStandard`, `RenewableDispatch`
+> - `using PowerSimulations` — required for `read_variable`, `list_variable_keys`, `get_timestamps`
+> - `using PowerAnalytics` / `using PowerAnalytics.Metrics` — high-level metric functions
+> - `using DataFrames`, `using CSV`, `using Dates` — data handling utilities
+
+### Project Directory
+
+The MCP server injects `PROJECT_DIR` into every script automatically.
+**Use `PROJECT_DIR` instead of `@__DIR__`** — `@__DIR__` resolves to the temp file
+directory, not your project root:
+
+```julia
+# CORRECT
+output_dir = joinpath(PROJECT_DIR, "analysis_outputs")
+mkpath(output_dir)
+CSV.write(joinpath(output_dir, "results.csv"), df)
+
+# WRONG — resolves to /tmp/jl_XXXXX/
+output_dir = joinpath(@__DIR__, "analysis_outputs")
+```
+
+### Script Structure (PowerAnalytics high-level path)
+
 Every analysis script follows this pattern:
 1. **Imports** (the preamble above)
-2. **Load results**: `create_problem_results_dict(results_dir, problem_name; populate_system=true)`
-3. **Select scenario**: `results_uc = results_all[first(keys(results_all))]`
+2. **Load results** — always pass `scenarios` explicitly (see note below)
+3. **Select scenario**
 4. **Create selectors**: `selector = make_selector(ComponentType)`
 5. **Compute metrics**: `df = calc_some_metric(selector, results_uc)`
 6. **Output results**: print summary, save to CSV if large
+
+```julia
+{JULIA_PREAMBLE}
+results_dir = "/path/to/simulation_results"
+results_all = create_problem_results_dict(
+    results_dir, "UC";
+    scenarios=["Scenario_1", "Scenario_2"],  # ALWAYS specify scenarios explicitly
+    populate_system=true,
+)
+results_uc = results_all["Scenario_1"]
+selector = make_selector(ThermalStandard)
+df = calc_active_power(selector, results_uc)
+```
+
+> **Critical: always pass `scenarios` explicitly.**
+> Without it, `create_problem_results_dict` scans ALL subdirectories — including CSV
+> output folders — and fails with "No valid simulation in ...csv" or
+> "Found more than one simulation name" errors.
+
+> **Warning: `populate_system=true` is memory-intensive.**
+> On constrained systems it will cause an OOM crash (-32000 error).
+> See the "Low-memory alternative" section in `julia_error_handling`.
+
+### Low-Level Path (no populate_system, no OOM risk)
+
+```julia
+using PowerSimulations, PowerSystems, DataFrames, CSV, Dates
+
+path = "/path/to/scenario"
+sr = PowerSimulations.SimulationResults(path)
+pr = PowerSimulations.get_decision_problem_results(sr, "UC")  # no populate_system
+
+# List what's available
+vars = list_variable_keys(pr)
+println(vars)
+
+# Read one variable
+df = read_variable(pr, ActivePowerVariable, ThermalStandard)
+println(size(df))
+show(stdout, "text/plain", first(df, 5))
+```
+
+### Chunked Reading for Large Datasets
+
+Reading 30+ days × many generators in one call causes OOM.
+Process in weekly (or smaller) chunks:
+
+```julia
+using PowerSimulations, PowerSystems, DataFrames, CSV, Dates
+
+sr = PowerSimulations.SimulationResults("/path/to/scenario")
+pr = PowerSimulations.get_decision_problem_results(sr, "UC")
+timestamps = get_timestamps(pr)
+start = first(timestamps)
+
+all_chunks = DataFrame[]
+for week in 0:3  # 4 weeks
+    chunk_start = start + Day(7 * week)
+    chunk = read_variable(pr, ActivePowerVariable, ThermalStandard;
+        initial_time=chunk_start, count=7*24)
+    push!(all_chunks, chunk)
+end
+df = vcat(all_chunks...)
+println("Combined shape: ", size(df))
+CSV.write(joinpath(PROJECT_DIR, "analysis_outputs", "thermal_active_power.csv"), df)
+```
+
+> **Note on `read_variable` time kwargs:**
+> - Use `initial_time::DateTime` and `count::Int` (number of timesteps).
+> - `count=7*24` means 168 hourly steps (one week). There is NO `end_time` parameter.
 
 ### DataFrame Conventions
 - First column is always `DateTime` (hourly timestamps)
@@ -638,7 +847,6 @@ avg_per_unit = [mean(df[!, col]) for col in gen_cols]
 
 **Filter to specific components:**
 ```julia
-# Use make_selector with specific component names
 selector = make_selector(ThermalStandard, "321_CC_1")
 ```
 
@@ -646,7 +854,9 @@ selector = make_selector(ThermalStandard, "321_CC_1")
 - Do NOT use `using Plots` or any plotting library (no display available)
 - Do NOT use `@show` — use `println()` and `show(stdout, "text/plain", df)`
 - Do NOT print entire large DataFrames — print `size(df)`, `first(df, 5)`, `last(df, 5)`
-- Do NOT hardcode paths — use the `results_dir` parameter
+- Do NOT hardcode paths — use `PROJECT_DIR` or pass paths as variables
+- Do NOT use `@__DIR__` — it resolves to the temp file directory, use `PROJECT_DIR` instead
+- Do NOT omit the `scenarios` kwarg in `create_problem_results_dict`
 
 ### Handling Large Outputs
 If a DataFrame has many rows:
@@ -657,8 +867,10 @@ println("\\nFirst 5 rows:")
 show(stdout, "text/plain", first(df, 5))
 println("\\n\\nLast 5 rows:")
 show(stdout, "text/plain", last(df, 5))
-CSV.write("results/output.csv", df)
-println("\\nFull data saved to results/output.csv")
+output_path = joinpath(PROJECT_DIR, "analysis_outputs", "output.csv")
+mkpath(dirname(output_path))
+CSV.write(output_path, df)
+println("\\nFull data saved to ", output_path)
 ```
 """
 
@@ -668,20 +880,65 @@ def julia_error_handling() -> str:
     """Guide for iterating and debugging Julia script errors.
 
     Covers how to read Julia error messages, common PowerAnalytics pitfalls,
-    iteration strategy, and when to give up.
+    the -32000 / OOM recovery workflow, iteration strategy, and when to give up.
     """
-    return """\
+    return f"""\
 ## Julia Error Handling Guide
+
+### MCP Error -32000 / "Connection closed" / Out of Memory
+
+This is the most common production failure. It means the Julia subprocess was
+killed by the OS (or ran out of memory) before it could return a result.
+
+**Root cause:** `populate_system=true` loads the full PowerSystems system into RAM.
+For large grids this can exceed available memory and crash the process.
+
+**Immediate fix — use `read_variable` directly (no system loading required):**
+
+```julia
+{JULIA_PREAMBLE}
+
+path = "/path/to/scenario"  # path to a single scenario directory
+sr = PowerSimulations.SimulationResults(path)
+pr = PowerSimulations.get_decision_problem_results(sr, "UC")  # no populate_system
+
+# Discover available variables
+vars = list_variable_keys(pr)
+println("Available variables:")
+for v in vars
+    println("  ", v)
+end
+
+# Read a specific variable
+df = read_variable(pr, ActivePowerVariable, ThermalStandard)
+println("Shape: ", size(df))
+show(stdout, "text/plain", first(df, 5))
+```
+
+**If even `read_variable` runs OOM, use chunked reading (see `julia_coding_guide`).**
+
+**Prevent future OOM crashes:**
+Set the `JULIA_MCP_MEMORY_LIMIT` environment variable (e.g. `"4G"`) before starting
+the MCP server. This makes Julia raise a graceful `OutOfMemoryError` instead of being
+killed silently.
+
+**Note on `read_variable` kwargs:**
+- `initial_time::DateTime` — start of the window
+- `count::Int` — number of timesteps (e.g. `count=7*24` for one week of hourly data)
+- There is NO `end_time` or `stop_time` parameter.
+
+---
 
 ### Reading Julia Error Messages
 
 **MethodError: no method matching func(::Type1, ::Type2)**
 - You passed wrong argument types. Check the docstring for correct signature.
-- Common cause: passing a string where a Type is expected (e.g. "ThermalStandard" instead of ThermalStandard).
+- Common cause: passing a string where a Type is expected (e.g. `"ThermalStandard"` instead of `ThermalStandard`).
 
 **LoadError: UndefVarError: `name` not defined**
 - Missing import. Add the appropriate `using` statement.
-- Check if the symbol exists in the module: read the API index resource.
+- Always include `using PowerSystems` when using component types.
+- Always include `using PowerSimulations` when using `read_variable` / `list_variable_keys`.
 
 **ArgumentError: ...**
 - Wrong argument value. Read the full error message for expected values.
@@ -691,6 +948,15 @@ def julia_error_handling() -> str:
 - The scenario name doesn't exist. List available keys first:
   `println(keys(results_all))`
 
+**"No valid simulation in ...csv" or "Found more than one simulation name"**
+- `create_problem_results_dict` scanned a non-simulation subdirectory (e.g. a CSV output folder).
+- Fix: always pass `scenarios` explicitly:
+  ```julia
+  create_problem_results_dict(results_dir, "UC"; scenarios=["Scenario_1", "Scenario_2"])
+  ```
+
+---
+
 ### Common PowerAnalytics Pitfalls
 
 1. **Wrong component type name**: Use exact names from `poweranalytics://component-types`.
@@ -699,10 +965,12 @@ def julia_error_handling() -> str:
 2. **Metric returns empty DataFrame**: The component type has no results in this simulation.
    Check with `list_result_files` that the simulation ran successfully.
 
-3. **Path not found**: Relative paths resolve from `PA_PROJECT_PATH`. Use absolute paths if unsure.
+3. **Path not found**: Use `PROJECT_DIR` (injected by the MCP server) instead of `@__DIR__`
+   or hardcoded paths.
 
-4. **Out of memory**: Large multi-scenario analyses can be memory-intensive.
-   Process one scenario at a time instead of loading all at once.
+4. **Out of memory**: See the -32000 section above. Use `read_variable` without `populate_system`.
+
+---
 
 ### Iteration Strategy
 1. Read the FULL error message carefully
@@ -728,13 +996,33 @@ def output_saving_conventions(results_dir: str = "_simulation_results_RTS") -> s
     return f"""\
 ## Output Saving Conventions
 
-### Directory Structure
-Save analysis outputs to: `{results_dir}/results/`
+### CRITICAL: Never save files inside the simulation results directory
 
-Create the directory in your Julia script if it doesn't exist:
+`PowerSimulations.jl` recursively scans **all** subdirectories of the results folder
+when loading simulations. If you save CSV files there, future calls will fail with:
+
+- `"No valid simulation in ...csv"`
+- `"Found more than one simulation name"`
+
+**Always use a separate output directory.**
+
+### Directory Structure
+
+Save analysis outputs to a dedicated directory **outside** the simulation results:
+
 ```julia
+# CORRECT: separate output directory
+output_dir = joinpath(PROJECT_DIR, "analysis_outputs")
+mkpath(output_dir)
+CSV.write(joinpath(output_dir, "Scenario_1_ThermalStandard_active_power.csv"), df)
+
+# WRONG: inside the simulation results directory
 mkpath("{results_dir}/results")
+CSV.write("{results_dir}/results/output.csv", df)  # This will break future loads!
 ```
+
+> `PROJECT_DIR` is injected by the MCP server and points to your Julia project root.
+> Use it instead of `@__DIR__` (which resolves to the temp file directory).
 
 ### File Naming Convention
 `{{scenario}}_{{ComponentType}}_{{metric}}.csv`
@@ -756,8 +1044,10 @@ Examples:
 ### After Saving
 Always print the file path so the user can find it:
 ```julia
-CSV.write("path/to/file.csv", df)
-println("Results saved to path/to/file.csv")
+out_path = joinpath(PROJECT_DIR, "analysis_outputs", "output.csv")
+mkpath(dirname(out_path))
+CSV.write(out_path, df)
+println("Results saved to ", out_path)
 ```
 
 ### Overwrite Policy
