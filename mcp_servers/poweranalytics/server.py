@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import textwrap
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -31,49 +32,50 @@ _RESOURCES_DIR = Path(__file__).parent / "resources"
 _FALLBACK_API_INDEX = """\
 # PowerAnalytics.jl — API Index
 
-> **Note:** This is a static fallback. Run `python generate_index.py` or call
-> `refresh_api_index()` to generate the full auto-generated index from your
-> installed PowerAnalytics.jl.
+> **Note:** This is a static fallback approximation. Run `python generate_index.py` or
+> call `refresh_api_index()` to generate the full auto-generated index from your
+> installed PowerAnalytics.jl. Some functions listed here may not exist in your version.
 
-## PowerAnalytics
+## PowerSimulations (Recommended primary path — no system JSON needed)
+
+Use these for reliable data access. They work without `set_system!` or a system JSON file.
+
+- `PowerSimulations.SimulationResults(path)` [Function]: Load simulation results from directory
+- `PowerSimulations.get_decision_problem_results(sr, problem_name)` [Function]: Get results for a specific decision problem
+- `read_variable(pr, VariableType, ComponentType)` [Function]: Read a single variable
+  - Signature: `read_variable(pr, ActivePowerVariable, ThermalStandard)`
+  - **Returns:** `SortedDict{DateTime, DataFrame}` — one entry per execution step (NOT a single DataFrame)
+  - Each sub-DataFrame has 3 columns: `DateTime`, `name` (component name), `value` (MW) — **long/tidy format**
+  - Optional kwargs: `initial_time::DateTime`, `count::Int` (number of timesteps, NOT end time)
+  - **Note:** use `count`, not a stop time. Example: `count=7*24` for one week of hourly data.
+  - **Note:** if `initial_time` falls mid-step, `count` measures from that timestamp. Align to execution step starts for predictable results.
+  - Requires: `using PowerSystems` for component type, `using PowerSimulations` for variable type
+- `list_variable_keys(pr)` [Function]: List all available (VariableType, ComponentType) pairs
+  - Output is verbose — use the pretty-print pattern from `julia_coding_guide` to extract readable names
+- `get_timestamps(pr)` [Function]: Return execution step start times (one per rolling-horizon solve)
+  - **Note:** This returns the simulation execution cadence (e.g. 31 daily starts), NOT the individual data timesteps (e.g. 744 hourly values). For the full time axis, use the `DateTime` column from `read_variable`.
+
+## PowerAnalytics (High-level path — requires system JSON via `set_system!`)
+
+> **WARNING:** The high-level metric functions (`calc_active_power`, etc.) require a
+> PowerSystems system JSON file attached to the results via `set_system!(pr, path)`.
+> If your simulation results don't include a system JSON, use `read_variable` above.
 
 - `create_problem_results_dict` [Function]: Load simulation results into a Dict mapping scenario name → ProblemResults
-  - Signature: `create_problem_results_dict(results_dir, problem_name; scenarios=nothing, populate_system=false)`
+  - Signature: `create_problem_results_dict(results_dir, problem_name; scenarios=nothing)`
   - **Always pass `scenarios` explicitly** to avoid scanning non-simulation subdirectories.
-  - **Avoid `populate_system=true`** on memory-constrained systems — see `julia_error_handling` for the low-memory alternative.
 - `make_selector` [Function]: Create a ComponentSelector for filtering by PowerSystems.jl component type
   - Signature: `make_selector(ComponentType)` or `make_selector(ComponentType, "name_substring")`
 - `ComponentSelector` [Type]: Selector object used by all `calc_*` metric functions
 
-## PowerAnalytics.Metrics
+## PowerAnalytics.Metrics (requires system JSON)
 
-- `calc_active_power` [Function]: Compute active power time series for selected components
-  - Signature: `calc_active_power(selector::ComponentSelector, results::IS.Results) → DataFrame`
-  - Returns DataFrame with DateTime column + one column per component (MW)
-  - Requires: `using PowerSystems` for component type argument to `make_selector`
-- `calc_production_cost` [Function]: Compute production cost time series
-  - Signature: `calc_production_cost(selector::ComponentSelector, results::IS.Results) → DataFrame`
-- `calc_capacity_factor` [Function]: Compute capacity factor (generation / capacity)
-  - Signature: `calc_capacity_factor(selector::ComponentSelector, results::IS.Results) → DataFrame`
-- `calc_active_power_in` [Function]: Compute active power flowing into storage/loads
-- `calc_active_power_out` [Function]: Compute active power flowing out of storage
-- `calc_load_following_up` [Function]: Compute load following up reserve provision
-- `calc_load_following_down` [Function]: Compute load following down reserve provision
-- `calc_energy_storage` [Function]: Compute stored energy time series for storage units
-
-## PowerSimulations (lower-level fallback, no populate_system needed)
-
-Use these when PowerAnalytics metrics fail due to memory constraints:
-
-- `PowerSimulations.SimulationResults(path)` [Function]: Load simulation results from directory
-- `PowerSimulations.get_decision_problem_results(sr, problem_name)` [Function]: Get results for a specific decision problem (no populate_system)
-- `read_variable(pr, VariableType, ComponentType)` [Function]: Read a single variable as DataFrame
-  - Signature: `read_variable(pr, ActivePowerVariable, ThermalStandard)`
-  - Optional kwargs: `initial_time::DateTime`, `count::Int` (number of timesteps, NOT end time)
-  - **Note:** use `count`, not a stop time. Example: `count=7*24` for one week of hourly data.
-  - Requires: `using PowerSystems` for component type, `using PowerSimulations` for variable type
-- `list_variable_keys(pr)` [Function]: List all available (VariableType, ComponentType) pairs
-- `get_timestamps(pr)` [Function]: Return the vector of DateTime timestamps in the results
+- `calc_active_power` [Const]: Compute active power time series for selected components
+  - Usage: `compute(calc_active_power, results, selector)` (requires `set_system!` first)
+- `calc_production_cost` [Const]: Compute production cost time series
+- `calc_capacity_factor` [Const]: Compute capacity factor (generation / capacity)
+- `calc_active_power_in` [Const]: Compute active power flowing into storage/loads
+- `calc_active_power_out` [Const]: Compute active power flowing out of storage
 """
 
 _FALLBACK_COMPONENT_TYPES = """\
@@ -119,6 +121,9 @@ def _load_resource(filename: str, fallback: str) -> str:
 # ---------------------------------------------------------------------------
 
 API_INDEX_SCRIPT = """\
+using Logging
+global_logger(ConsoleLogger(stderr, Logging.Warn))
+
 using PowerSystems
 using PowerSimulations
 using StorageSystemsSimulations
@@ -145,29 +150,42 @@ for (mod_name, mod) in modules
     for name in sort(names(mod; all=false))
         name == Symbol(mod_name) && continue
         name == Symbol(split(mod_name, ".")[end]) && continue
-        obj = getfield(mod, name)
-        doc_str = string(Base.doc(obj))
-        # Extract first meaningful line
-        lines = filter(!isempty, split(doc_str, "\\n"))
-        first_line = isempty(lines) ? "No documentation" : strip(lines[1])
-        # Truncate long lines
-        if length(first_line) > 120
-            first_line = first_line[1:117] * "..."
+        # Guard against symbols that are exported but not defined (e.g.
+        # PluralComponentSelector in some PowerAnalytics versions)
+        if !isdefined(mod, name)
+            continue
         end
-        kind = if obj isa Type
-            "Type"
-        elseif obj isa Function
-            "Function"
-        else
-            "Const"
+        try
+            obj = getfield(mod, name)
+            doc_str = string(Base.doc(obj))
+            # Extract first meaningful line
+            lines = filter(!isempty, split(doc_str, "\\n"))
+            first_line = isempty(lines) ? "No documentation" : strip(lines[1])
+            # Truncate long lines
+            if length(first_line) > 120
+                first_line = first_line[1:117] * "..."
+            end
+            kind = if obj isa Type
+                "Type"
+            elseif obj isa Function
+                "Function"
+            else
+                "Const"
+            end
+            println("- `", name, "` [", kind, "]: ", first_line)
+        catch e
+            # Skip symbols that can't be introspected (re-exports, broken bindings)
+            @warn "Skipping symbol $name in $mod_name" exception=e
         end
-        println("- `", name, "` [", kind, "]: ", first_line)
     end
     println()
 end
 """
 
 COMPONENT_TYPES_SCRIPT = """\
+using Logging
+global_logger(ConsoleLogger(stderr, Logging.Warn))
+
 using PowerSystems
 using InteractiveUtils
 
@@ -215,42 +233,69 @@ end
 
 @asynccontextmanager
 async def _lifespan(server):
-    """Auto-generate API index files on first startup when they are missing.
+    """Lightweight startup — no Julia calls to avoid blocking MCP handshake.
 
-    Only runs Julia if a sysimage is configured (fast path ~5-6s).
-    Falls back gracefully if Julia is unavailable or fails.
+    Resource auto-generation is deferred to the first `check_julia_environment`
+    call so that the MCP server registers tools immediately.
     """
+    _RESOURCES_DIR.mkdir(exist_ok=True)
+    logger.info("PowerAnalytics MCP server started (tools registered).")
+    yield
+
+
+_auto_gen_attempted = False  # Prevent repeated auto-generation attempts
+
+
+async def _auto_generate_resources() -> str | None:
+    """Auto-generate API index files if missing and sysimage is available.
+
+    Returns a status message, or None if no generation was needed.
+    Called by check_julia_environment after verifying Julia works.
+
+    Uses a module-level flag to prevent retrying a failed generation on every
+    call — once attempted (success or failure), subsequent calls return None
+    until the server is restarted or refresh_api_index() is called explicitly.
+    """
+    global _auto_gen_attempted
+
     api_path = _RESOURCES_DIR / "api_index.md"
     comp_path = _RESOURCES_DIR / "component_types.md"
 
-    if not (api_path.is_file() and comp_path.is_file()):
-        sysimage = SYSIMAGE_PATH
-        if sysimage and Path(sysimage).is_file():
-            logger.info("API index files missing — auto-generating with sysimage...")
-            _RESOURCES_DIR.mkdir(exist_ok=True)
-            result = await _run_julia(API_INDEX_SCRIPT)
-            if result["exit_code"] == 0:
-                api_path.write_text(result["stdout"])
-                symbol_count = result["stdout"].count("\n- ")
-                logger.info("api_index.md generated (%d symbols).", symbol_count)
-            else:
-                logger.warning(
-                    "API index generation failed: %s", result["stderr"][:200]
-                )
-            result = await _run_julia(COMPONENT_TYPES_SCRIPT)
-            if result["exit_code"] == 0:
-                comp_path.write_text(result["stdout"])
-                logger.info("component_types.md generated.")
-            else:
-                logger.warning(
-                    "Component types generation failed: %s", result["stderr"][:200]
-                )
-        else:
-            logger.warning(
-                "API index files missing and no sysimage configured. "
-                "Run 'python generate_index.py' for the full API index."
-            )
-    yield
+    if api_path.is_file() and comp_path.is_file():
+        return None
+
+    # Don't retry if we already attempted (and failed) in this server session
+    if _auto_gen_attempted:
+        return None
+
+    sysimage = SYSIMAGE_PATH
+    if not (sysimage and Path(sysimage).is_file()):
+        return (
+            "API index files missing and no sysimage configured. "
+            "Run 'python generate_index.py' or call refresh_api_index() "
+            "for the full API index."
+        )
+
+    _auto_gen_attempted = True
+    logger.info("API index files missing — auto-generating with sysimage...")
+    messages = []
+
+    result = await _run_julia(API_INDEX_SCRIPT)
+    if result["exit_code"] == 0:
+        api_path.write_text(result["stdout"])
+        symbol_count = result["stdout"].count("\n- ")
+        messages.append(f"api_index.md generated ({symbol_count} symbols).")
+    else:
+        messages.append(f"API index generation failed: {result['stderr'][:200]}")
+
+    result = await _run_julia(COMPONENT_TYPES_SCRIPT)
+    if result["exit_code"] == 0:
+        comp_path.write_text(result["stdout"])
+        messages.append("component_types.md generated.")
+    else:
+        messages.append(f"Component types generation failed: {result['stderr'][:200]}")
+
+    return "\n".join(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +334,12 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 JULIA_PREAMBLE = """\
+# Suppress Info-level logging to prevent stderr contamination of MCP stdio stream.
+# Julia's [ Info: ] messages from package loading and data operations can corrupt
+# the JSON-RPC framing, causing -32000 "Connection closed" errors.
+using Logging
+global_logger(ConsoleLogger(stderr, Logging.Warn))
+
 using PowerSystems
 using PowerSimulations
 using StorageSystemsSimulations
@@ -296,9 +347,13 @@ using HydroPowerSimulations
 using DataFrames
 using Dates
 using CSV
+using Statistics
 using PowerAnalytics
 using PowerAnalytics.Metrics
 """
+
+# Maximum characters for stderr output to prevent buffer overflow and context bloat
+_MAX_STDERR_LENGTH = 2000
 
 
 async def _run_julia(script: str, project_path: str | None = None) -> dict:
@@ -314,6 +369,10 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
       being killed by the OS.
     - Out-of-memory conditions are detected and returned as a structured error
       message rather than a silent "Connection closed".
+    - **Stderr is redirected to a temp file** (not a pipe) to prevent pipe
+      buffer deadlocks that cause -32000 "Connection closed" errors. Julia
+      packages can emit large volumes of stderr during loading and data
+      operations that fill the OS pipe buffer (~64KB), blocking the process.
     """
     project = project_path or str(PA_PROJECT_PATH)
 
@@ -326,6 +385,17 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
     ) as tmp:
         tmp.write(full_script)
         tmp_path = tmp.name
+
+    # Redirect stderr to a temp file to avoid pipe buffer deadlock.
+    # Julia packages emit large volumes of stderr (Info logs, precompilation
+    # messages, warnings) that can fill the OS pipe buffer (~64KB on most
+    # systems). When both stdout and stderr are pipes, a full stderr buffer
+    # blocks the Julia process, which in turn blocks stdout, causing
+    # asyncio.communicate() to hang until the MCP client times out with
+    # error -32000 "Connection closed".
+    stderr_tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix="_stderr.txt", delete=False
+    )
 
     try:
         cmd = [JULIA_EXECUTABLE]
@@ -341,14 +411,17 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=stderr_tmp,  # temp file, NOT a pipe — prevents deadlock
             cwd=project,  # run from project root so relative paths work
         )
-        stdout, stderr = await asyncio.wait_for(
+        stdout_bytes, _ = await asyncio.wait_for(
             proc.communicate(), timeout=SCRIPT_TIMEOUT
         )
-        stdout_str = stdout.decode()
-        stderr_str = stderr.decode()
+        stdout_str = stdout_bytes.decode()
+
+        # Read stderr from the temp file after the process completes
+        stderr_tmp.close()
+        stderr_str = Path(stderr_tmp.name).read_text()
 
         # Detect out-of-memory conditions (SIGKILL from OS or Julia OOM error)
         is_oom = (
@@ -361,8 +434,8 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
             oom_hint = (
                 "Julia process ran out of memory.\n"
                 "Suggestions:\n"
-                "  1. Avoid `populate_system=true` — use `read_variable` directly (see julia_error_handling prompt).\n"
-                "  2. Process smaller time windows with `initial_time` and `count` parameters.\n"
+                "  1. Use `read_variable` directly with `initial_time` and `count` to process smaller time windows.\n"
+                "  2. Break the script into smaller steps — save intermediate results to CSV and load in the next script.\n"
                 "  3. Set the JULIA_MCP_MEMORY_LIMIT env var (e.g. '4G') for a graceful OOM error next time.\n"
                 "  4. Read the `julia_error_handling` prompt for the full low-memory alternative workflow.\n"
             )
@@ -388,18 +461,39 @@ async def _run_julia(script: str, project_path: str | None = None) -> dict:
         }
     finally:
         os.unlink(tmp_path)
+        try:
+            os.unlink(stderr_tmp.name)
+        except OSError:
+            pass
 
 
 def _format_result(result: dict) -> str:
-    """Format a Julia execution result into a readable string."""
+    """Format a Julia execution result into a readable string.
+
+    Shows stdout first (the actual data), then stderr (diagnostics).
+    Filters out Julia's informational '[ Info: ]' log lines from stderr
+    regardless of exit code — they add noise and are never actionable.
+    Truncates stderr to ``_MAX_STDERR_LENGTH`` to prevent buffer overflow
+    and excessive context consumption.
+    """
     parts = []
     if result["exit_code"] != 0:
         parts.append(f"Exit code: {result['exit_code']}")
-    if result["stderr"]:
-        parts.append(f"--- stderr ---\n{result['stderr']}")
     if result["stdout"]:
         parts.append(f"--- stdout ---\n{result['stdout']}")
-    if not result["stdout"] and not result["stderr"]:
+    # Filter Info lines always — they're noise from package loading / data ops
+    stderr = result["stderr"]
+    if stderr:
+        stderr = "\n".join(
+            line for line in stderr.splitlines()
+            if not line.strip().startswith("[ Info:")
+        ).strip()
+    # Truncate verbose error output (e.g. MethodError dumping entire objects)
+    if stderr and len(stderr) > _MAX_STDERR_LENGTH:
+        stderr = stderr[:_MAX_STDERR_LENGTH] + "\n... (stderr truncated)"
+    if stderr:
+        parts.append(f"--- stderr ---\n{stderr}")
+    if not result["stdout"] and not stderr:
         parts.append("(no output)")
     return "\n".join(parts)
 
@@ -414,19 +508,44 @@ async def run_julia_script(script: str, project_path: str | None = None) -> str:
     """Execute an arbitrary Julia script and return its output.
 
     The script runs as a subprocess with the PowerAnalytics.jl project activated.
-    Use this for custom analysis not covered by the high-level tools.
+    The standard preamble (package imports + logging suppression) is automatically
+    prepended unless the script already manages its own imports (detected by the
+    presence of `using PowerAnalytics`, `using PowerSimulations`, `using Logging`,
+    `redirect_stderr`, or `global_logger`).
 
     Args:
         script: Complete Julia source code to execute.
         project_path: Optional path to a Julia project to activate (defaults to PA_PROJECT_PATH).
     """
+    # Detect if the script has its own import/stderr management
+    _has_own_imports = any(kw in script for kw in [
+        "using PowerAnalytics",
+        "using PowerSimulations",
+        "using Logging",
+        "redirect_stderr",
+        "global_logger",
+    ])
+
+    preamble_injected = False
+    if not _has_own_imports:
+        script = JULIA_PREAMBLE + "\n" + script
+        preamble_injected = True
+
     result = await _run_julia(script, project_path)
-    return _format_result(result)
+    formatted = _format_result(result)
+
+    if preamble_injected:
+        formatted = "(Note: standard preamble was auto-prepended)\n" + formatted
+
+    return formatted
 
 
 @mcp.tool()
 async def check_julia_environment(project_path: str | None = None) -> str:
     """Verify that Julia is available and PowerAnalytics.jl can be loaded.
+
+    Also auto-generates API index files on first call if they are missing
+    and a sysimage is available.
 
     Args:
         project_path: Optional path to the Julia project to check.
@@ -437,9 +556,17 @@ println("PowerAnalytics loaded successfully.")
 println("Project: ", Base.active_project())
 """
     result = await _run_julia(script, project_path)
-    if result["exit_code"] == 0:
-        return f"Environment OK.\n{result['stdout']}"
-    return f"Environment check FAILED.\n{_format_result(result)}"
+    if result["exit_code"] != 0:
+        return f"Environment check FAILED.\n{_format_result(result)}"
+
+    parts = [f"Environment OK.\n{result['stdout']}"]
+
+    # Auto-generate resource files if missing (deferred from lifespan)
+    gen_msg = await _auto_generate_resources()
+    if gen_msg:
+        parts.append(f"\nResource generation: {gen_msg}")
+
+    return "\n".join(parts)
 
 
 @mcp.tool()
@@ -451,10 +578,15 @@ async def get_docstring(
     Use this to read detailed documentation (signature, arguments, return type,
     examples) for functions discovered in the poweranalytics://api-index resource.
 
+    **IMPORTANT:** Do NOT call multiple `get_docstring` in parallel. Each call
+    spawns a Julia subprocess; parallel calls can overwhelm the MCP connection.
+    Call them sequentially (one at a time).
+
     Args:
         symbol_name: Name of the Julia symbol (e.g. "calc_active_power", "make_selector").
         module_name: Module containing the symbol. One of: "PowerAnalytics",
-            "PowerAnalytics.Metrics", "PowerAnalytics.Selectors".
+            "PowerAnalytics.Metrics", "PowerAnalytics.Selectors",
+            "PowerSimulations", "PowerSystems", "DataFrames".
     """
     # Input validation
     if not symbol_name.isidentifier():
@@ -464,6 +596,9 @@ async def get_docstring(
         "PowerAnalytics",
         "PowerAnalytics.Metrics",
         "PowerAnalytics.Selectors",
+        "PowerSimulations",
+        "PowerSystems",
+        "DataFrames",
     }
     if module_name not in allowed_modules:
         return (
@@ -471,23 +606,40 @@ async def get_docstring(
             f"Allowed modules: {', '.join(sorted(allowed_modules))}"
         )
 
+    # Use @doc syntax to get the docstring attached to the *binding* (e.g.
+    # `@doc PowerAnalytics.Metrics.calc_active_power`), not the docstring of
+    # the object's type.  `Base.doc(getfield(mod, sym))` would return the
+    # docstring for `ComponentTimedMetric` when called on an instance like
+    # `calc_active_power`, which is wrong.
     script = f"""{JULIA_PREAMBLE}
 mod = {module_name}
 sym = Symbol("{symbol_name}")
 if isdefined(mod, sym)
     obj = getfield(mod, sym)
-    doc_str = string(Base.doc(obj))
+
+    # Use @doc on the binding, not on the object value
+    doc_str = string(eval(:(@doc $mod.$sym)))
     lines = filter(!isempty, split(doc_str, "\\n"))
-    # Heuristic: if the docstring doesn't mention the symbol name in the first
-    # few lines it likely belongs to an internal type (e.g. generated by a macro).
-    # In that case we skip the docstring and fall straight to method signatures.
-    mentions_sym = any(l -> contains(l, "{symbol_name}"), lines[1:min(4, length(lines))])
-    has_content = length(lines) >= 3
-    if has_content && mentions_sym
-        println(doc_str)
+    has_content = length(lines) >= 2
+
+    # For Const values (e.g. metric instances), also show type and name info
+    if !(obj isa Function) && !(obj isa Type)
+        println("## `{symbol_name}` — ", typeof(obj))
         println()
     end
-    # Always show concrete method signatures — indispensable for macro-generated functions
+
+    if has_content
+        # Truncate very long docstrings (e.g. from generic types) to 3000 chars
+        if length(doc_str) > 3000
+            println(doc_str[1:3000])
+            println("\\n... (docstring truncated)")
+        else
+            println(doc_str)
+        end
+        println()
+    end
+
+    # Always show concrete method signatures for functions
     if obj isa Function
         ms = methods(obj)
         if length(ms) > 0
@@ -499,9 +651,8 @@ if isdefined(mod, sym)
         else
             println("No methods found for `{symbol_name}` in {module_name}.")
         end
-    elseif !(has_content && mentions_sym)
-        # Not a function and no useful docstring — print whatever we have
-        println(doc_str)
+    elseif !has_content
+        println("No documentation found for `{symbol_name}` in {module_name}.")
     end
 else
     println("Symbol `{symbol_name}` not found in {module_name}.")
@@ -522,7 +673,9 @@ async def refresh_api_index() -> str:
     resources/*.md files, and returns the updated symbol count.
     Use this after updating PowerAnalytics.jl without restarting the server.
     """
+    global _auto_gen_attempted
     _RESOURCES_DIR.mkdir(exist_ok=True)
+    _auto_gen_attempted = True  # Mark as attempted so auto-gen doesn't re-run
     errors = []
 
     # Generate API index
@@ -661,40 +814,53 @@ Explain patterns in power systems context. Point to saved CSVs for full data.
 Task: "Get thermal generation for the RTS system"
 
 1. `check_julia_environment()` → OK
-2. Read `poweranalytics://api-index` → find `create_problem_results_dict`, `make_selector`, `calc_active_power`
+2. Read `poweranalytics://api-index` → find `read_variable`, `list_variable_keys`
 3. Read `poweranalytics://component-types` → identify `ThermalStandard`
-4. `get_docstring("calc_active_power", "PowerAnalytics.Metrics")` → full signature + method list
-   `get_docstring("make_selector", "PowerAnalytics")` → selector docs
+4. `get_docstring("read_variable", "PowerSimulations")` → full signature
 5. Write and execute:
 ```julia
 {JULIA_PREAMBLE}
-# Load results — always pass scenarios explicitly to avoid scanning CSV output folders
-results_all = create_problem_results_dict(
-    "{results_dir}", "{problem_name}";
-    scenarios=["Scenario_1"],   # list actual scenario folder names
-    populate_system=true,
-)
-results_uc = results_all["Scenario_1"]
-selector = make_selector(ThermalStandard)
-df = calc_active_power(selector, results_uc)
-println("Shape: ", size(df))
-println("Columns: ", names(df))
+
+# Load results for one scenario — no populate_system needed (low memory)
+scenario_path = joinpath("{results_dir}", "Scenario_1")
+sr = PowerSimulations.SimulationResults(scenario_path)
+pr = PowerSimulations.get_decision_problem_results(sr, "{problem_name}")
+
+# Read thermal generation — returns SortedDict{{DateTime, DataFrame}}
+raw = read_variable(pr, ActivePowerVariable, ThermalStandard)
+println("Execution steps: ", length(raw))
+
+# Deduplicate rolling-horizon overlap (keep realized portion only)
+exec_times = sort(collect(keys(raw)))
+step = exec_times[min(2, length(exec_times))] - exec_times[1]  # e.g. Day(1)
+realized = DataFrame[]
+for (i, t) in enumerate(exec_times)
+    sub = copy(raw[t])
+    t_next = i < length(exec_times) ? exec_times[i+1] : t + step
+    filter!(row -> row.DateTime >= t && row.DateTime < t_next, sub)
+    push!(realized, sub)
+end
+df_long = vcat(realized...)
+
+# Pivot to wide format for per-generator analysis
+df_wide = unstack(df_long, :DateTime, :name, :value)
+sort!(df_wide, :DateTime)
+gen_cols = names(df_wide)[2:end]
+println("Shape: ", size(df_wide))
+println("Generators: ", length(gen_cols))
+println("\\nFirst rows:")
+show(stdout, "text/plain", first(df_wide, 5))
 println()
-println("First rows:")
-show(stdout, "text/plain", first(df, 5))
-println()
-# Save to a separate output directory — NEVER inside the simulation results folder
+
+# Save — NEVER inside the simulation results folder
 out_path = joinpath(PROJECT_DIR, "analysis_outputs", "Scenario_1_ThermalStandard_active_power.csv")
 mkpath(dirname(out_path))
-CSV.write(out_path, df)
+CSV.write(out_path, df_wide)
 println("Saved to ", out_path)
 ```
 6. File saved to `<PROJECT_DIR>/analysis_outputs/Scenario_1_ThermalStandard_active_power.csv`
-7. Present: "76 thermal units, 744 hourly periods. Nuclear baseload at ~400 MW,
+7. Present: "73 thermal units, 744 hourly periods. Nuclear baseload at ~400 MW,
    combined-cycle units range 170-355 MW, peaking CTs dispatched during high-demand hours."
-
-> **If Step 5 fails with -32000 / OOM**, skip `populate_system` and use `read_variable` directly.
-> Read the `julia_error_handling` prompt for the complete low-memory workflow.
 """
 
 
@@ -737,91 +903,151 @@ CSV.write(joinpath(output_dir, "results.csv"), df)
 output_dir = joinpath(@__DIR__, "analysis_outputs")
 ```
 
-### Script Structure (PowerAnalytics high-level path)
+### Script Structure (Recommended: low-level `read_variable` path)
 
 Every analysis script follows this pattern:
 1. **Imports** (the preamble above)
-2. **Load results** — always pass `scenarios` explicitly (see note below)
-3. **Select scenario**
-4. **Create selectors**: `selector = make_selector(ComponentType)`
-5. **Compute metrics**: `df = calc_some_metric(selector, results_uc)`
+2. **Load results** via `PowerSimulations.SimulationResults(path)` per scenario
+3. **Get problem results** via `get_decision_problem_results(sr, "UC")`
+4. **Read variables** via `read_variable(pr, VariableType, ComponentType)`
+5. **Deduplicate** rolling-horizon overlap (see below)
 6. **Output results**: print summary, save to CSV if large
+
+### Low-Level Path (direct variable access, no OOM risk)
+
+> **This is the recommended primary path.** It works reliably without needing
+> a PowerSystems system JSON file attached to the results.
+
+`read_variable` returns a `SortedDict{{DateTime, DataFrame}}` — one entry per execution step,
+**not** a single DataFrame. Each sub-DataFrame has 3 columns in **long/tidy format**:
+`DateTime`, `name` (component name), `value` (MW).
 
 ```julia
 {JULIA_PREAMBLE}
-results_dir = "/path/to/simulation_results"
-results_all = create_problem_results_dict(
-    results_dir, "UC";
-    scenarios=["Scenario_1", "Scenario_2"],  # ALWAYS specify scenarios explicitly
-    populate_system=true,
-)
-results_uc = results_all["Scenario_1"]
-selector = make_selector(ThermalStandard)
-df = calc_active_power(selector, results_uc)
-```
-
-> **Critical: always pass `scenarios` explicitly.**
-> Without it, `create_problem_results_dict` scans ALL subdirectories — including CSV
-> output folders — and fails with "No valid simulation in ...csv" or
-> "Found more than one simulation name" errors.
-
-> **Warning: `populate_system=true` is memory-intensive.**
-> On constrained systems it will cause an OOM crash (-32000 error).
-> See the "Low-memory alternative" section in `julia_error_handling`.
-
-### Low-Level Path (no populate_system, no OOM risk)
-
-```julia
-using PowerSimulations, PowerSystems, DataFrames, CSV, Dates
 
 path = "/path/to/scenario"
 sr = PowerSimulations.SimulationResults(path)
-pr = PowerSimulations.get_decision_problem_results(sr, "UC")  # no populate_system
+pr = PowerSimulations.get_decision_problem_results(sr, "UC")
 
-# List what's available
+# List what's available (pretty-print verbose output)
 vars = list_variable_keys(pr)
-println(vars)
+println("Available variables:")
+for v in vars
+    s = string(v)
+    m = match(r"\\{{([^,]+),\\s*([^\\}}]+)\\}}", s)
+    if m !== nothing
+        var_name = split(m[1], ".")[end]
+        comp_name = split(strip(m[2]), ".")[end]
+        println("  ", var_name, " — ", comp_name)
+    else
+        println("  ", s)
+    end
+end
 
-# Read one variable
-df = read_variable(pr, ActivePowerVariable, ThermalStandard)
-println(size(df))
-show(stdout, "text/plain", first(df, 5))
+# Read one variable — returns SortedDict{{DateTime, DataFrame}}
+raw = read_variable(pr, ActivePowerVariable, ThermalStandard)
+println("Type: ", typeof(raw))
+println("Execution steps: ", length(raw))
+
+# Peek at one sub-DataFrame (long format: DateTime, name, value)
+first_key = first(keys(raw))
+println("\\nFirst execution step (", first_key, "):")
+show(stdout, "text/plain", first(raw[first_key], 5))
+```
+
+### Rolling-Horizon Deduplication
+
+Rolling-horizon simulations (e.g. 48h lookahead, daily execution) produce **overlapping**
+data: hours 25–48 of day N overlap with hours 1–24 of day N+1. Without deduplication,
+`vcat`-ing all sub-DataFrames produces duplicate timestamps and inflated statistics.
+
+**Keep only the "realized" portion of each execution step** (from its start to the next
+step's start):
+
+```julia
+# raw = read_variable(pr, ActivePowerVariable, ThermalStandard)
+exec_times = sort(collect(keys(raw)))
+step = exec_times[min(2, length(exec_times))] - exec_times[1]  # e.g. Day(1)
+realized = DataFrame[]
+for (i, t) in enumerate(exec_times)
+    sub = copy(raw[t])
+    t_next = i < length(exec_times) ? exec_times[i+1] : t + step
+    filter!(row -> row.DateTime >= t && row.DateTime < t_next, sub)
+    push!(realized, sub)
+end
+df_long = vcat(realized...)
+println("Deduplicated rows: ", nrow(df_long))
+println("Unique timestamps: ", length(unique(df_long.DateTime)))
+```
+
+### Pivoting from Long to Wide Format
+
+After deduplication, pivot the long-format DataFrame to wide format for per-component
+analysis:
+
+```julia
+# df_long has columns: DateTime, name, value
+df_wide = unstack(df_long, :DateTime, :name, :value)
+sort!(df_wide, :DateTime)
+println("Wide shape: ", size(df_wide))
+println("Columns: ", names(df_wide))
+gen_cols = names(df_wide)[2:end]  # skip DateTime
 ```
 
 ### Chunked Reading for Large Datasets
 
-Reading 30+ days × many generators in one call causes OOM.
+Reading 30+ days × many generators in one call can cause OOM.
 Process in weekly (or smaller) chunks:
 
 ```julia
-using PowerSimulations, PowerSystems, DataFrames, CSV, Dates
+{JULIA_PREAMBLE}
 
 sr = PowerSimulations.SimulationResults("/path/to/scenario")
 pr = PowerSimulations.get_decision_problem_results(sr, "UC")
-timestamps = get_timestamps(pr)
-start = first(timestamps)
+exec_times = get_timestamps(pr)  # execution step starts, NOT hourly timestamps
+start = first(exec_times)
 
 all_chunks = DataFrame[]
 for week in 0:3  # 4 weeks
     chunk_start = start + Day(7 * week)
-    chunk = read_variable(pr, ActivePowerVariable, ThermalStandard;
+    raw_chunk = read_variable(pr, ActivePowerVariable, ThermalStandard;
         initial_time=chunk_start, count=7*24)
-    push!(all_chunks, chunk)
+    # raw_chunk is a SortedDict — concatenate its sub-DataFrames
+    for (t, sub) in raw_chunk
+        push!(all_chunks, sub)
+    end
 end
-df = vcat(all_chunks...)
-println("Combined shape: ", size(df))
-CSV.write(joinpath(PROJECT_DIR, "analysis_outputs", "thermal_active_power.csv"), df)
+df_long = vcat(all_chunks...)
+println("Combined long-format shape: ", size(df_long))
+CSV.write(joinpath(PROJECT_DIR, "analysis_outputs", "thermal_active_power.csv"), df_long)
 ```
 
 > **Note on `read_variable` time kwargs:**
 > - Use `initial_time::DateTime` and `count::Int` (number of timesteps).
 > - `count=7*24` means 168 hourly steps (one week). There is NO `end_time` parameter.
+> - If `initial_time` falls mid-step, `count` measures from that timestamp.
+>   Align `initial_time` to execution step starts (from `keys(raw)`) for predictable results.
+> - If `count` exceeds available timesteps, the result contains only the available data (no error).
+
+> **Note on `get_timestamps(pr)`:**
+> Returns simulation execution starts (one per rolling-horizon solve, e.g. 31 daily starts),
+> NOT the individual data timesteps (e.g. 744 hourly values). For the full time axis,
+> use the `DateTime` column from `read_variable` after deduplication.
 
 ### DataFrame Conventions
-- First column is always `DateTime` (hourly timestamps)
-- Data columns are named `TypeName__component_name` (e.g. `ThermalStandard__321_CC_1`)
+
+**High-level path** (`calc_active_power` etc.) returns a **wide** DataFrame:
+- First column is `DateTime` (hourly timestamps)
+- Data columns named `TypeName__component_name` (e.g. `ThermalStandard__321_CC_1`)
 - Access data columns: `names(df)[2:end]` (skip DateTime)
 - Total across components: `sum(eachcol(df[!, names(df)[2:end]]))`
+
+**Low-level path** (`read_variable` + `unstack`) returns **different** column names:
+- After `unstack`, columns are just the component name (e.g. `321_CC_1`) — no type prefix
+- To normalize for comparison with the high-level path:
+  ```julia
+  rename!(df_wide, [c => "ThermalStandard__$c" for c in gen_cols])
+  ```
 
 ### Type System
 - **Concrete types** for selectors: `ThermalStandard`, `RenewableDispatch`, `EnergyReservoirStorage`
@@ -856,7 +1082,39 @@ selector = make_selector(ThermalStandard, "321_CC_1")
 - Do NOT print entire large DataFrames — print `size(df)`, `first(df, 5)`, `last(df, 5)`
 - Do NOT hardcode paths — use `PROJECT_DIR` or pass paths as variables
 - Do NOT use `@__DIR__` — it resolves to the temp file directory, use `PROJECT_DIR` instead
-- Do NOT omit the `scenarios` kwarg in `create_problem_results_dict`
+- Do NOT omit the `scenarios` kwarg in `create_problem_results_dict` (high-level path only)
+- Do NOT assume the high-level path (`compute(metric, ...)`) works without `set_system!`
+- Do NOT use `typemax(DateTime)` for rolling-horizon dedup boundaries — use the step
+  duration (e.g. `t + step`) to avoid including extra lookahead data
+
+### High-Level Path (requires system JSON — use only if available)
+
+> **WARNING:** The high-level path (`create_problem_results_dict` → `make_selector` →
+> `compute(metric, results, selector)`) requires a PowerSystems system JSON file attached
+> to the results via `set_system!(pr, "/path/to/system.json")`. Many simulation results
+> directories do NOT include this file. **If your results only contain `simulation_store.h5`
+> and metadata files, use the low-level `read_variable` path above instead.**
+
+```julia
+{JULIA_PREAMBLE}
+results_dir = "/path/to/simulation_results"
+results_all = create_problem_results_dict(
+    results_dir, "UC";
+    scenarios=["Scenario_1", "Scenario_2"],  # ALWAYS specify scenarios explicitly
+)
+results_uc = results_all["Scenario_1"]
+
+# REQUIRED: attach system data (only if system.json exists)
+# set_system!(results_uc, "/path/to/system.json")
+
+selector = make_selector(ThermalStandard)
+df = calc_active_power(selector, results_uc)
+```
+
+> **Critical: always pass `scenarios` explicitly.**
+> Without it, `create_problem_results_dict` scans ALL subdirectories — including CSV
+> output folders — and fails with "No valid simulation in ...csv" or
+> "Found more than one simulation name" errors.
 
 ### Handling Large Outputs
 If a DataFrame has many rows:
@@ -890,30 +1148,51 @@ def julia_error_handling() -> str:
 This is the most common production failure. It means the Julia subprocess was
 killed by the OS (or ran out of memory) before it could return a result.
 
-**Root cause:** `populate_system=true` loads the full PowerSystems system into RAM.
-For large grids this can exceed available memory and crash the process.
+**Root cause:** Large data operations can exceed available memory and crash
+the process. The MCP server now suppresses Julia's `[ Info: ]` log messages
+to prevent stderr contamination of the JSON-RPC stream, which was the most
+common cause of `-32000` errors.
 
-**Immediate fix — use `read_variable` directly (no system loading required):**
+**If you still see `-32000`:** The script may be too large or produce too much
+output. Break it into smaller steps and save intermediate results to files.
+
+**Use `read_variable` directly for reliable data access:**
 
 ```julia
 {JULIA_PREAMBLE}
 
 path = "/path/to/scenario"  # path to a single scenario directory
 sr = PowerSimulations.SimulationResults(path)
-pr = PowerSimulations.get_decision_problem_results(sr, "UC")  # no populate_system
+pr = PowerSimulations.get_decision_problem_results(sr, "UC")
 
-# Discover available variables
+# Discover available variables (pretty-print verbose output)
 vars = list_variable_keys(pr)
 println("Available variables:")
 for v in vars
-    println("  ", v)
+    s = string(v)
+    m = match(r"\\{{([^,]+),\\s*([^\\}}]+)\\}}", s)
+    if m !== nothing
+        var_name = split(m[1], ".")[end]
+        comp_name = split(strip(m[2]), ".")[end]
+        println("  ", var_name, " — ", comp_name)
+    else
+        println("  ", s)
+    end
 end
 
-# Read a specific variable
-df = read_variable(pr, ActivePowerVariable, ThermalStandard)
-println("Shape: ", size(df))
-show(stdout, "text/plain", first(df, 5))
+# Read a specific variable — returns SortedDict{{DateTime, DataFrame}}, NOT a single DataFrame
+raw = read_variable(pr, ActivePowerVariable, ThermalStandard)
+println("Execution steps: ", length(raw))
+
+# Each sub-DataFrame has columns: DateTime, name, value (long format)
+first_key = first(keys(raw))
+println("\\nFirst sub-DataFrame (", first_key, "):")
+show(stdout, "text/plain", first(raw[first_key], 5))
 ```
+
+> **Important:** `read_variable` returns overlapping data from rolling-horizon solves.
+> See the "Rolling-Horizon Deduplication" section in `julia_coding_guide` before computing
+> statistics or totals.
 
 **If even `read_variable` runs OOM, use chunked reading (see `julia_coding_guide`).**
 
@@ -955,6 +1234,12 @@ killed silently.
   create_problem_results_dict(results_dir, "UC"; scenarios=["Scenario_1", "Scenario_2"])
   ```
 
+**"ArgumentError: No system attached, need to call set_system!"**
+- The high-level path (`compute(metric, results, selector)`) requires a PowerSystems system
+  JSON file. Use `set_system!(pr, "/path/to/system.json")` before calling `compute`.
+- **If no system JSON is available**, use the low-level `read_variable` path instead —
+  it works without `set_system!`. See `julia_coding_guide` for the recommended pattern.
+
 ---
 
 ### Common PowerAnalytics Pitfalls
@@ -968,7 +1253,18 @@ killed silently.
 3. **Path not found**: Use `PROJECT_DIR` (injected by the MCP server) instead of `@__DIR__`
    or hardcoded paths.
 
-4. **Out of memory**: See the -32000 section above. Use `read_variable` without `populate_system`.
+4. **Out of memory**: See the -32000 section above. Use `read_variable` with chunked reading.
+
+5. **`MethodError: no method matching size(::SortedDict...)`**: You called `size(df)` on
+   the raw result of `read_variable`, which returns a `SortedDict{{DateTime, DataFrame}}`,
+   not a single DataFrame. Use `length(raw)` for the number of execution steps, then
+   access individual sub-DataFrames via `raw[key]`.
+
+6. **More unique timestamps than expected**: You likely have rolling-horizon overlap.
+   A 31-day simulation with 48h lookahead produces overlapping data for each execution
+   step. Deduplicate using the pattern in `julia_coding_guide` — the last step boundary
+   should use the step duration (e.g. `t + Day(1)`), NOT `typemax(DateTime)`, to avoid
+   including extra lookahead hours.
 
 ---
 
